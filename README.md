@@ -8,7 +8,8 @@ against. What the repository keeps is small: this Action in a workflow, and one 
 # .mo-eval/config.toml
 language = "go"
 test_command = "go test"
-worker_image = "golang:1.25-bookworm@sha256:…"   # pinned by digest
+worker_image = "golang:1.25-bookworm@sha256:…"   # pinned by digest; a mutable tag is refused
+# repo = "owner/name"   # only on a fork: whose merged pull requests are the record
 ```
 
 ```yaml
@@ -18,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       arms:
-        description: Model routes to evaluate on (space-separated); "none" builds only
+        description: Models to evaluate, space-separated ("none" = build the suite only)
         default: "anthropic/claude-opus-5 momento/zai-org/GLM-5.3"
 permissions:
   contents: read
@@ -28,9 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }        # older commits are exported; a shallow clone lacks them
-      - uses: actions/setup-go@v5       # whatever your CI does to become buildable, unchanged
-        with: { go-version-file: go.mod }
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - uses: momentohq/mo-eval-action@v1
         with:
           token: ${{ secrets.MO_EVAL_TOKEN }}
@@ -59,7 +62,7 @@ packages and the audit log of every crossing.
 | `history` | `300` | Merged pull requests offered as candidates |
 | `candidates` | `12` | Candidates the service is asked to source |
 | `config` | `.mo-eval/config.toml` | The repository's configuration |
-| `out` | `.mo-eval/out` | Where the suite is written |
+| `out` | runner temp | Where the suite is written; nothing lands in the checkout |
 
 The runner needs Python 3.11+ (present on GitHub's hosted runners) and `gh` (also present) and
 nothing else. The repository's toolchain must be on `PATH` before this step.

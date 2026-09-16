@@ -31,8 +31,10 @@ inputs:
     description: Path to the repository's mo-eval configuration, relative to the checkout
     default: ".mo-eval/config.toml"
   out:
-    description: Where the generated suite is written, relative to the checkout
-    default: ".mo-eval/out"
+    description: >-
+      Where the generated suite is written. Defaults to a directory under the runner's temp space,
+      so nothing is written into the repository's checkout.
+    default: ""
 
 runs:
   using: composite
@@ -44,11 +46,12 @@ runs:
       # toolchain must already be on PATH — set it up in the workflow before this step, the same
       # way the repository's CI does.
       run: |
+        echo "MO_EVAL_OUT=${{ inputs.out || format('{0}/mo-eval', runner.temp) }}" >> "$GITHUB_ENV"
         python3 "$GITHUB_ACTION_PATH/runner/main.py" suite \
           --repo "$GITHUB_WORKSPACE" --config "${{ inputs.config }}" \
           --service "${{ inputs.service }}" \
           --history "${{ inputs.history }}" --candidates "${{ inputs.candidates }}" \
-          --out "${{ inputs.out }}" \
+          --out "${{ inputs.out || format('{0}/mo-eval', runner.temp) }}" \
           ${{ inputs.arms != 'none' && format('--run {0}', inputs.arms) || '' }}
       env:
         MO_EVAL_TOKEN: ${{ inputs.token }}
@@ -58,7 +61,7 @@ runs:
       if: always()
       shell: bash
       run: |
-        out="${{ inputs.out }}"
+        out="$MO_EVAL_OUT"
         echo '## mo-eval suite' >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         ls -la "$out/wire" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
@@ -79,6 +82,6 @@ runs:
         # The task packages and the audit log of every crossing — what was mined, and what left
         # the runner. The runnable bundles go to the service directly and are not kept here.
         path: |
-          ${{ inputs.out }}/tasks
-          ${{ inputs.out }}/wire
+          ${{ env.MO_EVAL_OUT }}/tasks
+          ${{ env.MO_EVAL_OUT }}/wire
         retention-days: 30
