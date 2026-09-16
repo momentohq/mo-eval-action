@@ -86,6 +86,12 @@ def load_config(path: Path) -> RunnerConfig:
     env = raw.get("env", {})
     if not isinstance(env, dict) or not all(isinstance(v, str) for v in env.values()):
         raise ConfigError(f"{path}: `env` must be a table of string values")
+    declared_repo = raw.get("repo")
+    if declared_repo is not None and (not isinstance(declared_repo, str) or not declared_repo.strip()):
+        # TOML is happy to put an integer, a list or a table here. A truthy one of those reaches
+        # `gh repo view` as an argument and raises a `TypeError` out of the runner, rather than the
+        # `ConfigError` this function promises for every other wrong-shaped value.
+        raise ConfigError(f"{path}: `repo` must be a non-empty string, got {declared_repo!r}")
     image = raw.get("worker_image")
     if image is not None and not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", str(image)):
         raise ConfigError(f"{path}: `worker_image` must be pinned by digest (name@sha256:<64 hex>), got {image!r}")

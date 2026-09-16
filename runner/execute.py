@@ -12,13 +12,100 @@ itself declares, so the service chooses which tests run and never what runs them
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
+import signal
 import subprocess
+import tempfile
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from wire import OrderResult, Step, StepResult, WorkOrder
+
+_RUNNER_CREDENTIALS = (
+    "MO_EVAL_TOKEN",                  # the bearer this runner authenticates to the service with
+    "GH_TOKEN",                       # set by the Action so the forge can be queried
+    "GITHUB_TOKEN",
+    "ACTIONS_ID_TOKEN_REQUEST_URL",   # together, these MINT an identity for the repository
+    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+)
+"""What the runner itself brings into the job, and must take away again before running a test.
+
+A deny-list rather than an allow-list, which is the opposite of the rule for forwarding request
+headers — and deliberately so. A build needs an environment nobody can enumerate in advance
+(`GOCACHE`, `HOME`, `TMPDIR`, a hundred toolchain variables), so an allow-list here would break real
+repositories rather than protect them. What CAN be enumerated is what the runner introduced: its own
+bearer, the forge token the Action sets, and the pair that lets any code in the job mint an OIDC
+token as this repository — a privilege the workflow has only because our own snippet asked for it.
+The repository's own secrets stay: its tests already run with those in every other workflow it has.
+
+Half of a pair. This removes what is in the ENVIRONMENT; a credential on disk is untouched by it,
+which is why `action/mo-eval-suite.yml` checks out with `persist-credentials: false`. A scrub that
+holds only in memory reads as a boundary and is not one.
+"""
+
+
+def _without_the_runners_credentials(inherited: Mapping[str, str], declared: dict[str, str]) -> dict[str, str]:
+    """The environment a repository's own test command is run with.
+
+    The declared half is filtered too. `forward_env` names variables to carry over from the runner's
+    own environment, so a repository that named one of these would otherwise hand itself the
+    credential the inherited half just removed.
+    """
+    return {
+        name: value
+        for source in (inherited, declared)
+        for name, value in source.items()
+        if name not in _RUNNER_CREDENTIALS
+    }
+
+
+_GROUP_EXIT_SECONDS = 30
+"""How long a signalled process group is given to end before it is killed outright."""
+
+_MAX_STEPS_PER_ORDER = 200
+"""How many steps one order may carry. An order is four fixed steps plus two probes per graded
+test, so this is far above any real task."""
+
+_MAX_ORDER_SECONDS = 4 * 3600
+_MAX_RUNNER_SECONDS = 12 * 3600
+"""How long one order, and every order this runner carries out, may take in total.
+
+The step count is not a bound on cost on its own: 200 steps at an hour each is over a week of a
+customer's CI, and a suite is many orders. Each step's own deadline still applies; these two cut
+whichever comes first, so a service composing cheap-looking steps cannot spend an unbounded amount
+of someone else's CI in aggregate."""
+
+_MAX_SPOOLED_BYTES = 2 * 1024**3
+_OUTPUT_POLL_SECONDS = 5
+_EXIT_POLL_SECONDS = 0.05
+"""How much output one command may write, and how often that is checked. The tail is what gets
+reported; it does not stop the writing. A test command producing at device speed fills a CI
+runner's disk long before any per-step deadline."""
+
+_REDACTION_OVERLAP_BYTES = 4096
+"""How much beyond the reported tail is read, so a secret straddling the cut is still whole when it
+is replaced. Longer than any credential; short enough that the bound still bounds."""
+
+_REDACTED = "[redacted]"
+"""What a forwarded value is replaced with on its way back to the service."""
+
+_APPLY_TIMEOUT_SECONDS = 120
+"""A bound on `git apply`, the step that processes content the service supplied."""
+
+_LOCAL_COMMAND_SECONDS = 120
+"""A bound on the runner's own short commands — `git init`, `rustc -vV`. They take milliseconds on
+a working machine and hang indefinitely on a wedged filesystem or a stalled toolchain, and this
+process is the customer's CI job."""
+
+_ORDER_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+"""What an order id may be. The same shape the service enforces, checked again here because the
+runner must hold its own boundary rather than trust the service to have held it."""
+
+_COMMIT = re.compile(r"[0-9a-f]{7,64}")
+"""What a commit the service names may be: a hexadecimal object name and nothing else."""
 
 _OUTPUT_TAIL_BYTES = 4000
 _EXPORT_TIMEOUT_SECONDS = 600
@@ -26,8 +113,144 @@ _PROBE_TIMEOUT_SECONDS = 3600
 _SETUP_TIMEOUT_SECONDS = 1800
 
 
+def _bounded_output(argv: list[str], *, cwd, env: dict[str, str] | None, timeout: float) -> tuple[int, str]:
+    """Run a command and return its exit code and the tail of what it wrote.
+
+    The output is written to a temporary file and only the tail is read back. `capture_output`
+    would hold all of it in this process first, so the tail would be a display limit and not a
+    bound: a repository whose setup prints for half an hour has a CI runner's memory to fill
+    before the timeout ever arrives.
+    """
+    with tempfile.TemporaryFile("w+b") as sink:
+        # Its own process group, so the deadline takes the tree and not just its root. The command
+        # is the repository's own — `cargo test`, `pytest`, `make` — and each of those is a parent
+        # of compilers, test binaries and servers. Killing the root leaves those running on the CI
+        # runner after the workspace they were using has already been deleted.
+        child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=sink, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+        group = os.getpgid(child.pid)
+        try:
+            _wait_within(child, sink, timeout)
+        finally:
+            # Always, not only after a timeout. A test command's children outlive it often enough,
+            # and the workspace they hold open is deleted as soon as the order ends. The leader is
+            # reaped after this, not before: while it is still a zombie its pid is reserved, so the
+            # group id cannot have been recycled under a stranger by the time it is signalled.
+            #
+            # A command that ended on its own gets no grace period — it has already had its run,
+            # and what is left in its group are orphans holding a workspace about to be deleted.
+            # One that is being stopped gets the usual `SIGTERM` first.
+            _end_now(group) if _exited(child) else _end_group(group)
+            child.wait()
+        if sink.tell() > _MAX_SPOOLED_BYTES:
+            # Checked on the way out as well as while waiting: a command can write its whole flood
+            # inside one polling interval and exit, and the disk is just as full either way.
+            raise OrderError(f"the command wrote more than {_MAX_SPOOLED_BYTES} bytes of output")
+        # Read a little more than the tail so the caller can redact across the cut before it
+        # truncates: a credential straddling the boundary would otherwise keep its surviving half.
+        sink.seek(max(0, sink.tell() - (_OUTPUT_TAIL_BYTES + _REDACTION_OVERLAP_BYTES)))
+        return child.returncode, sink.read().decode(errors="replace")
+
+
+def _wait_within(child: subprocess.Popen, sink, timeout: float) -> None:
+    """Wait for a child, ending it if it runs too long or writes more than the runner will hold.
+
+    The tail is what gets reported; it is not backpressure. A command writing at device speed for
+    an hour fills the CI runner's disk whatever the tail says, so the spool is watched as it grows.
+
+    Raises:
+        subprocess.TimeoutExpired: If the deadline passes.
+        OrderError: If the command writes more output than this runner will spool.
+    """
+    deadline = time.monotonic() + timeout
+    weighed_at = time.monotonic()
+    while True:
+        if _exited(child):
+            return
+        now = time.monotonic()
+        if now - weighed_at >= _OUTPUT_POLL_SECONDS:
+            if sink.tell() > _MAX_SPOOLED_BYTES:
+                raise OrderError(f"the command wrote more than {_MAX_SPOOLED_BYTES} bytes of output")
+            weighed_at = now
+        remaining = deadline - now
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(child.args, timeout)
+        # Two rates: the child is looked for often, so a command that finishes is not waited on
+        # after it has, and the spool is weighed rarely, because its size is a bound on a runaway
+        # rather than something that changes meaningfully between one look and the next.
+        time.sleep(min(_EXIT_POLL_SECONDS, remaining))
+
+
+def _exited(child: subprocess.Popen) -> bool:
+    """Whether the child has finished, WITHOUT reaping it.
+
+    `wait` would reap, and a reaped pid is free to be reused — including as the id of somebody
+    else's process group, which is the thing the caller goes on to kill. Left as a zombie the pid
+    stays reserved until the caller has finished with it.
+    """
+    try:
+        return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+    except ChildProcessError:
+        return True
+
+
+def _end_now(group: int) -> None:
+    """Kill a process group outright, with no grace period."""
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+
+
+def _end_group(group: int) -> None:
+    """Signal a whole process group, and then kill it.
+
+    `SIGKILL` follows unconditionally rather than only when the leader is still alive. A test
+    command usually goes on `SIGTERM` while something it started does not, and waiting on the
+    leader reports that the group ended when only its leader did.
+
+    Takes the group rather than the process, and the caller reads it with `os.getpgid` while the
+    child is still running. Looked up afterwards it can be wrong in the dangerous direction: once
+    the leader is reaped its pid is free, and `getpgid` on a reused pid answers with a stranger's
+    group — which this function would then kill.
+    """
+    for signal_number in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group, signal_number)
+        except (ProcessLookupError, PermissionError):
+            return
+        if signal_number is signal.SIGTERM:
+            deadline = time.monotonic() + _GROUP_EXIT_SECONDS
+            while time.monotonic() < deadline and _group_alive(group):
+                time.sleep(0.1)
+            if not _group_alive(group):
+                return
+
+
+def _group_alive(group: int) -> bool:
+    """Whether any process in the group is still there."""
+    try:
+        os.killpg(group, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
 class OrderError(RuntimeError):
     """The runner could not carry an order out — distinct from a step that ran and exited non-zero."""
+
+
+def commit_or_refuse(value: str) -> str:
+    """A commit the service named, confirmed to be a commit before git is asked to resolve it.
+
+    `git archive` reads its tree-ish positionally, so a value beginning with a dash is read as an
+    option instead: `--output=<path>` truncates that path before git notices the tree is missing,
+    and `--remote=<url>` opens a connection out of the customer's CI. Every value the service names
+    goes through here, so nothing but a hexadecimal object name ever reaches git.
+    """
+    if not _COMMIT.fullmatch(value):
+        raise OrderError(f"the service named {value!r} as a commit, which is not one")
+    return value
 
 
 def _host_target() -> str:
@@ -37,16 +260,44 @@ def _host_target() -> str:
     writes `{host_target}` in its declared command and the runner fills it in; the service never
     supplies it, because the service does not know what machine this is.
     """
-    probe = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True)
+    probe = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True,
+                           timeout=_LOCAL_COMMAND_SECONDS)
     for line in probe.stdout.splitlines():
         if line.startswith("host: "):
             return line.removeprefix("host: ").strip()
     raise OrderError("rustc reported no host triple")
 
 
+def _fills(part: str, argument: str) -> bool:
+    """Whether `argument` is `part` with its placeholders filled and nothing else changed.
+
+    A placeholder takes anything that is not another option. A test's name is nearly unconstrained
+    — Ginkgo, Jest and RSpec all name tests in prose, spaces included — but nothing a test is
+    called begins with `-`, and that is the character that turns a selector into an instruction.
+    There is no shell here, so what an argument contains reaches the tool as one argument; what
+    matters is whether the tool will read it as a flag.
+    """
+    if "{" not in part:
+        return argument == part
+    pattern = "".join(
+        r"(?!-).*" if piece in ("{name}", "{package}") else re.escape(piece)
+        for piece in re.split(r"(\{name\}|\{package\})", part)
+    )
+    return re.fullmatch(pattern, argument, re.DOTALL) is not None
+
+
 def _expand(command: str) -> list[str]:
-    """Split the declared test command, expanding the placeholders a runner is allowed to fill."""
-    return [part.replace("{host_target}", _host_target()) for part in shlex.split(command)]
+    """Split the declared test command, expanding the placeholders a runner is allowed to fill.
+
+    `_host_target` shells out to `rustc`, so it is resolved only when a part actually carries the
+    placeholder. Resolving it unconditionally would make every Go or Python probe depend on a Rust
+    toolchain being installed.
+    """
+    parts = shlex.split(command)
+    if not any("{host_target}" in part for part in parts):
+        return parts
+    triple = _host_target()
+    return [part.replace("{host_target}", triple) for part in parts]
 
 
 class Runner:
@@ -59,6 +310,8 @@ class Runner:
         test_command: str,
         env: dict[str, str],
         setup_command: str | None = None,
+        secret_names: tuple[str, ...] = (),
+        filter_template: str = "",
     ) -> None:
         """
         Args:
@@ -68,12 +321,28 @@ class Runner:
             setup_command: The repository's declared command for making a checkout testable, if any.
             env: Extra environment for probes (a shared `CARGO_TARGET_DIR` keeps builds incremental
                 across candidates, which is the difference between minutes and hours).
+            filter_template: The language contract's own argument template. Probe arguments are
+                checked against it, so the service can only ask for a test by name. Empty means the
+                repository declared a language with no filter, and no probe arguments are accepted.
+            secret_names: Which names in `env` came from `forward_env` — the secret-bearing half of
+                the declaration. Their values are taken out of every output tail before it crosses
+                back to the service, whatever their length.
         """
         self.repo = repo
         self.workspaces = workspaces
         self.test_command = test_command
         self.setup_command = setup_command
+        self.filter_template = filter_template
         self.env = env
+        self._test_environment = _without_the_runners_credentials(os.environ, env)
+        # The values of the names `forward_env` carried, at any length, and nothing else. Length was
+        # the wrong test: `forward_env` is the secret-bearing half of the declaration, so a short
+        # value there is a short credential, while a long one in `env` is a long build flag.
+        # Longest first, so a value that contains another is replaced before its substring is.
+        self._secrets = tuple(sorted(
+            {env[name] for name in (secret_names or ()) if env.get(name)}, key=len, reverse=True))
+        self._runner_deadline = time.monotonic() + _MAX_RUNNER_SECONDS
+        self._deadline = self._runner_deadline
 
     def run(self, order: WorkOrder) -> OrderResult:
         """Carry out one order, reporting each step's exit code and nothing more.
@@ -82,16 +351,55 @@ class Runner:
             The step results, or an `OrderResult` carrying `error` when the order could not be
             carried out at all. A failure to run is never reported as a step verdict.
         """
+        if not _ORDER_ID.match(order.order_id):
+            # The order id names a directory this method creates and then deletes. An id like
+            # `../something` would put that directory — and the deletion — outside the workspace
+            # root, in the customer's own checkout. The service is not trusted to be well behaved.
+            return OrderResult(order_id=order.order_id, steps=[], error="malformed order id")
+        if len(order.steps) > _MAX_STEPS_PER_ORDER:
+            # The runner's own bound on what one order may cost its CI. Each probe may run for an
+            # hour, so the number of them is the number that matters, and the service composing
+            # them is the party this runner does not assume is well behaved.
+            return OrderResult(order_id=order.order_id, steps=[],
+                               error=f"order carries {len(order.steps)} steps; at most {_MAX_STEPS_PER_ORDER}")
         workspace = self.workspaces / order.order_id
         results: list[StepResult] = []
+        self._deadline = min(time.monotonic() + _MAX_ORDER_SECONDS, self._runner_deadline)
         try:
             for step in order.steps:
                 results.append(self._step(step, workspace))
+        except subprocess.TimeoutExpired as failure:
+            # `run` promises an OrderResult carrying `error`. A timeout in export or setup would
+            # otherwise leave the caller with an uncaught exception instead of a reported failure.
+            if time.monotonic() >= self._deadline:
+                # The step was cut short because the order's budget ran out, not because the step
+                # itself was slow. Reporting its truncated deadline would name the wrong bound.
+                return OrderResult(order_id=order.order_id, steps=results,
+                                   error="the order ran out of time")
+            return OrderResult(order_id=order.order_id, steps=results,
+                               error=f"a step timed out after {failure.timeout:.0f}s")
         except OrderError as failure:
             return OrderResult(order_id=order.order_id, steps=results, error=str(failure))
+        except OSError as failure:
+            # A setup or test command naming an executable this runner does not have. `run` promises
+            # an `OrderResult` carrying `error`; without this the caller gets a traceback and the
+            # whole suite stops on one repository's misdeclared command.
+            return OrderResult(order_id=order.order_id, steps=results,
+                               error=f"a step could not be started: {failure}")
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
         return OrderResult(order_id=order.order_id, steps=results)
+
+    def _within_deadline(self, timeout: float) -> float:
+        """This step's deadline, cut to what is left of the order's and the runner's.
+
+        Raises:
+            OrderError: If neither budget has any time left.
+        """
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise OrderError("the order ran out of time before this step")
+        return min(timeout, remaining)
 
     def _step(self, step: Step, workspace: Path) -> StepResult:
         started = time.monotonic()
@@ -118,24 +426,10 @@ class Runner:
         if workspace.exists():
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True)
-        archive = subprocess.Popen(
-            ["git", "archive", "--format=tar", step.commit],
-            cwd=self.repo,
-            stdout=subprocess.PIPE,
-        )
-        extract = subprocess.run(
-            ["tar", "-xf", "-", "-C", str(workspace)],
-            stdin=archive.stdout,
-            capture_output=True,
-            text=True,
-            timeout=_EXPORT_TIMEOUT_SECONDS,
-        )
-        if archive.stdout is not None:
-            archive.stdout.close()
-        if archive.wait() != 0 or extract.returncode != 0:
-            raise OrderError(f"could not export {step.commit}: {extract.stderr[-400:]}")
+        _export_into(self.repo, commit_or_refuse(step.commit),
+                     workspace, self._within_deadline(_EXPORT_TIMEOUT_SECONDS))
         _freshen(workspace)
-        _own_repository(workspace)
+        _own_repository(workspace, self._within_deadline(_LOCAL_COMMAND_SECONDS))
 
     def _setup(self, step: Step, workspace: Path, started: float) -> StepResult:
         """Make the exported checkout testable, using the command the REPOSITORY declared.
@@ -146,27 +440,32 @@ class Runner:
         """
         if self.setup_command is None:
             return self._result(step, 0, started, "no setup command declared")
-        completed = subprocess.run(
-            shlex.split(self.setup_command),
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            env={**os.environ, **self.env},
-            timeout=_SETUP_TIMEOUT_SECONDS,
+        exit_code, tail = _bounded_output(
+            shlex.split(self.setup_command), cwd=workspace,
+            env=self._test_environment, timeout=self._within_deadline(_SETUP_TIMEOUT_SECONDS),
         )
-        tail = (completed.stdout + completed.stderr)[-_OUTPUT_TAIL_BYTES:]
-        return self._result(step, completed.returncode, started, tail)
+        return self._result(step, exit_code, started, tail)
 
     def _apply(self, step: Step, workspace: Path, started: float) -> StepResult:
         if step.patch is None:
             raise OrderError("apply step carries no patch")
         patch_file = workspace / ".mo-eval-order.patch"
-        patch_file.write_text(step.patch)
+        # Written through O_NOFOLLOW after unlinking: the workspace holds an exported repository,
+        # and a repository may contain a file of this name — as a symlink to anywhere. `write_text`
+        # would follow it and overwrite the target.
+        patch_file.unlink(missing_ok=True)
+        try:
+            descriptor = os.open(patch_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except OSError as failure:
+            raise OrderError(f"could not write the patch: {failure}") from failure
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(step.patch)
         completed = subprocess.run(
             ["git", "apply", "--whitespace=nowarn", str(patch_file)],
             cwd=workspace,
             capture_output=True,
             text=True,
+            timeout=self._within_deadline(_APPLY_TIMEOUT_SECONDS),
         )
         patch_file.unlink(missing_ok=True)
         tail = (completed.stdout + completed.stderr)[-_OUTPUT_TAIL_BYTES:]
@@ -176,21 +475,53 @@ class Runner:
         """Run the repository's declared test command with the service's arguments appended."""
         if step.args is None:
             raise OrderError("probe step carries no args")
+        arguments = self._filter_or_refuse(step.args)
         directory = self._resolve(workspace, step.cwd)
-        command = [*_expand(self.test_command), *step.args]
+        # Before `_expand`, which may shell out to `rustc` for the host triple: rendering the
+        # command is work too, and an exhausted budget should stop it rather than fund one more
+        # process.
+        budget = self._within_deadline(_PROBE_TIMEOUT_SECONDS)
+        command = [*_expand(self.test_command), *arguments]
         try:
-            completed = subprocess.run(
-                command,
-                cwd=directory,
-                capture_output=True,
-                text=True,
-                env={**os.environ, **self.env},
-                timeout=_PROBE_TIMEOUT_SECONDS,
+            exit_code, tail = _bounded_output(
+                command, cwd=directory, env=self._test_environment, timeout=budget,
             )
         except subprocess.TimeoutExpired:
+            if time.monotonic() >= self._deadline:
+                # The order's budget ran out mid-probe. Reported as a step that timed out, it would
+                # read as a test that hung — a verdict about the repository rather than about this
+                # runner having stopped, and `run` would report no error at all.
+                raise
             return self._result(step, 124, started, "probe timed out")
-        tail = (completed.stdout + completed.stderr)[-_OUTPUT_TAIL_BYTES:]
-        return self._result(step, completed.returncode, started, tail)
+        return self._result(step, exit_code, started, tail)
+
+    def _filter_or_refuse(self, arguments: list[str]) -> list[str]:
+        """Probe arguments, confirmed to be a test filter and not a different command.
+
+        The module's claim is that the service chooses which tests run and never what runs them,
+        and appending whatever it sent does not hold that: a test tool's arguments include
+        execution controls as well as selectors — `go test -exec <program>` names the program that
+        runs the test binary, in a CI job with the customer's credentials in it. So the arguments
+        are matched against the shape this repository's own language contract produces: the literal
+        parts have to be exactly the contract's, and the parts filled from a test's name or package
+        may be anything that is not another option.
+
+        Raises:
+            OrderError: If the arguments are not ones this contract's filter could have produced.
+        """
+        expected = shlex.split(self.filter_template)
+        scope = 2 if arguments[:1] == ["-p"] and len(arguments) == len(expected) + 2 else 0
+        if scope:
+            # Cargo's `-p <package>`, which the service prepends to the template's own arguments.
+            if arguments[1].startswith("-"):
+                raise OrderError(f"probe argument {arguments[1]!r} is not a package")
+        if len(arguments) - scope != len(expected):
+            raise OrderError(
+                f"probe carries {len(arguments)} argument(s); this language's filter takes {len(expected)}")
+        for argument, part in zip(arguments[scope:], expected):
+            if not _fills(part, argument):
+                raise OrderError(f"probe argument {argument!r} is not {part!r} filled in")
+        return arguments
 
     def _resolve(self, workspace: Path, relative: str | None) -> Path:
         """Resolve a probe's working directory inside the workspace.
@@ -216,11 +547,65 @@ class Runner:
             step_id=step.step_id,
             exit_code=exit_code,
             duration_seconds=round(time.monotonic() - started, 2),
-            output_tail=tail,
+            output_tail=self._reported(tail),
         )
 
+    def _reported(self, output: str) -> str:
+        """The tail of a command's output, with the repository's forwarded secrets taken out.
 
-def _own_repository(workspace: Path) -> None:
+        Redacted first and cut afterwards. Cutting first leaves whatever half of a value fell
+        inside the window, and a credential with a known prefix is mostly its second half.
+        """
+        return self._redacted(output)[-_OUTPUT_TAIL_BYTES:]
+
+    def _redacted(self, tail: str) -> str:
+        """Command output with the repository's forwarded secrets taken out of it.
+
+        `forward_env` carries a repository's own credentials into the environment its tests run in,
+        which is the point — its tests need them. The output of those tests is the one thing that
+        crosses back to the service, and a failing test that prints its environment, a stack trace
+        that renders a client object, or a verbose HTTP log would carry the value with it. Every
+        tail goes through here, so there is one place that has to be right rather than one per step.
+        """
+        for secret in self._secrets:
+            tail = tail.replace(secret, _REDACTED)
+        return tail
+
+
+def _export_into(repo: Path, commit: str, workspace: Path, timeout: float) -> None:
+    """Stream a commit's tree out of `repo` and unpack it into `workspace`.
+
+    The producer is held in its own session so a deadline takes it and not only the extraction it
+    feeds, and both its pipe and the process itself are released whether the extraction succeeded,
+    failed or ran out of time.
+
+    Raises:
+        OrderError: If either side fails, or the producer does not finish.
+        subprocess.TimeoutExpired: If the extraction does not finish.
+    """
+    archive = subprocess.Popen(["git", "archive", "--format=tar", "--", commit], cwd=repo,
+                               stdout=subprocess.PIPE, start_new_session=True)
+    group = os.getpgid(archive.pid)
+    try:
+        extract = subprocess.run(["tar", "-xf", "-", "-C", str(workspace)], stdin=archive.stdout,
+                                 capture_output=True, text=True, timeout=timeout)
+    finally:
+        if archive.stdout is not None:
+            archive.stdout.close()
+        try:
+            # The producer's own failure is reported below; here it is only made to stop. It is
+            # writing into a pipe nobody reads any more, so it ends on its own or it is ended.
+            archive.wait(timeout=_GROUP_EXIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _end_group(group)
+            archive.wait()
+    if archive.returncode != 0:
+        raise OrderError(f"could not read {commit} out of the repository")
+    if extract.returncode != 0:
+        raise OrderError(f"could not export {commit}: {extract.stderr[-400:]}")
+
+
+def _own_repository(workspace: Path, timeout: float = _LOCAL_COMMAND_SECONDS) -> None:
     """Make an exported tree its own Git repository, so `git apply` resolves paths against IT.
 
     Run inside a repository, `git apply` takes patch paths relative to that repository's root and
@@ -230,7 +615,8 @@ def _own_repository(workspace: Path) -> None:
     start state, which the judge read as "already passes". An empty repository in the workspace
     stops discovery at the workspace boundary.
     """
-    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True, capture_output=True,
+                   timeout=timeout)
 
 
 def _freshen(workspace: Path) -> None:
@@ -251,6 +637,6 @@ def _freshen(workspace: Path) -> None:
     """
     for path in workspace.rglob("*"):
         try:
-            os.utime(path, None)
+            os.utime(path, None, follow_symlinks=False)
         except OSError:
             continue

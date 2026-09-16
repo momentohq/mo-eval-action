@@ -19,27 +19,137 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from languages import LANGUAGES, detect_framework  # noqa: E402
+from languages import LANGUAGES, Language, detect_framework, resolve_contract  # noqa: E402
 from runner.client import ServiceError, client_for  # noqa: E402
-from runner.collect import change_source, repo_facts  # noqa: E402
+from runner.collect import bounded_text, change_source, repo_facts, tracked_files  # noqa: E402
 from runner.config import CONFIG_PATH, ConfigError, load_config, probe_environment  # noqa: E402
-from runner.execute import Runner  # noqa: E402
-from wire import ConventionSources, ReviewComment, RunRequest, TaskPackage, UploadRequest, VerdictReport, Wire  # noqa: E402
+from runner.execute import (OrderError, Runner, _bounded_output, _end_group,  # noqa: E402
+                            _export_into, _without_the_runners_credentials, commit_or_refuse)
+from wire import (ConventionSources, RepoFacts, ReviewComment, RunRequest, TaskPackage, UploadRequest,  # noqa: E402
+                  VerdictReport, Wire)
+
+
+def _safe_relative(name: str, into: Path) -> Path:
+    """A service-supplied file name resolved under `into`, or a refusal.
+
+    The service names the files a package is written as. It is not trusted to keep them inside the
+    output directory, so `..`, an absolute path and a symlinked parent are all rejected here.
+    """
+    candidate = (into / name)
+    if name.startswith("/") or ".." in Path(name).parts:
+        raise ValueError(f"the service returned the path {name!r}, which leaves the output directory")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(into.resolve()):
+        raise ValueError(f"the service returned the path {name!r}, which resolves outside the output directory")
+    # And no component of it is a link. `resolve()` follows them, so a path whose ancestor points
+    # somewhere else INSIDE the tree still lands under `into` and passes the check above — a
+    # checked-in `.mo-eval -> src` would put these writes in the repository's own source and change
+    # the start tree the oracle was proven against. `O_NOFOLLOW` guards only the last component.
+    walked = into
+    for part in Path(name).parts:
+        walked = walked / part
+        if walked.is_symlink():
+            raise ValueError(f"the path {name!r} passes through the link {walked.name!r}")
+    return resolved
+
+
+_MAX_WRITTEN_FILES = 2_000
+_MAX_WRITTEN_BYTES = 64 * 1024 * 1024
+"""How much of one package this runner will put on the customer's disk. A task is a handful of
+files: a manifest, a prompt, a patch, a scorer. The decoder's own bound admits a hundred thousand
+strings of sixteen megabytes each, which is a disk the runner does not own."""
+
+
+def _write_all(files: Mapping[str, str], into: Path, kind: str) -> None:
+    """Write a service-supplied map of paths to contents under `into`.
+
+    Counted before anything is written, so a refusal leaves no half-written tree behind.
+
+    Raises:
+        ValueError: If the map carries more files, or more bytes, than this runner will write — or
+            a path that leaves `into`.
+    """
+    if len(files) > _MAX_WRITTEN_FILES:
+        raise ValueError(f"the service returned {len(files)} {kind} files; at most {_MAX_WRITTEN_FILES}")
+    total = sum(len(content.encode()) for content in files.values())
+    if total > _MAX_WRITTEN_BYTES:
+        raise ValueError(f"the service returned {total} bytes of {kind}; at most {_MAX_WRITTEN_BYTES}")
+    # Every path resolved before the first is written. Checked as it went, a map whose last entry
+    # escapes the directory would be refused with the rest of it already on disk.
+    resolved = [(_safe_relative(name, into), content) for name, content in files.items()]
+    for path, content in resolved:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
 
 
 def write_package(package: TaskPackage, into: Path) -> Path:
     """Write a package the service returned as `into/<task_id>/`. The runner writes what it is
     handed; it does not import the service to do so."""
-    directory = into / package.task_id
+    directory = _safe_relative(package.task_id, into)
     directory.mkdir(parents=True, exist_ok=True)
-    for name, content in package.files.items():
-        (directory / name).write_text(content)
+    _write_all(package.files, directory, "package")
     return directory
+
+
+def _write_without_following(path: Path, content: str) -> None:
+    """Write into an exported, repository-controlled tree without following a symlink already there.
+
+    The tree came from the repository, so a file of this name may be checked in as a link to
+    anywhere the CI user can write. `O_NOFOLLOW | O_EXCL` after unlinking writes the path itself.
+    """
+    path.unlink(missing_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(content)
+
+
+_OFFLINE_PREPARE_SECONDS = 1800
+"""A deadline on vendoring. It resolves a dependency graph from a tree whose commit the service
+chose, which is long work but not endless work."""
+
+_GIT_SECONDS = 600
+_APPLY_SECONDS = 120
+_EXPORT_SECONDS = 600
+"""Deadlines for the commands that build a bundle. The commit they run over is named by the
+service and the patch is composed by it, so none of them is a wait this runner should make
+without an end — the same bounds `runner/execute.py` puts on the identical operations."""
+
+_FORGE_SECONDS = 120
+"""A bound on the one command here that leaves the machine. `gh` retries and follows redirects, and
+an unreachable forge would otherwise hold a CI job open until the job's own limit ended it."""
+
+
+def _bounded(argv: list[str], *, cwd: Path, timeout: float = _GIT_SECONDS,
+             env: dict[str, str] | None = None) -> None:
+    """Run one command to completion under a deadline, or raise `OrderError`.
+
+    Through the same wait a probe gets, and for the same reasons: its output is spooled rather than
+    held in this process, the whole process group is ended whether it finished or not, and the
+    leader is reaped only after the group has been signalled — so a package manager that prints for
+    an hour cannot exhaust the runner, and a recycled pid cannot receive the kill.
+
+    Args:
+        env: The whole environment for the child, or `None` to inherit this process's. Name one for
+            anything the repository chose, which is not the same as anything this runner runs.
+
+    Raises:
+        OrderError: If the command fails, does not finish, or writes more than the runner spools.
+            The runner's callers report that as a message and an exit code; a `CalledProcessError`
+            would be a traceback.
+    """
+    named = " ".join(argv[:2])
+    try:
+        exit_code, tail = _bounded_output(argv, cwd=cwd, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired as expired:
+        raise OrderError(f"{named} did not finish within {timeout:.0f}s") from expired
+    if exit_code != 0:
+        raise OrderError(f"{named} failed: {tail[-400:]!r}")
 
 
 def write_local_suite(package: TaskPackage, repo: Path, into: Path) -> Path | None:
@@ -53,38 +163,33 @@ def write_local_suite(package: TaskPackage, repo: Path, into: Path) -> Path | No
     if not package.local_suite:
         return None
     meta = json.loads(package.files["meta.json"])
-    root = into / package.task_id
+    root = _safe_relative(package.task_id, into)
     if root.exists():
         shutil.rmtree(root)
     root.mkdir(parents=True)
-    archive = subprocess.Popen(["git", "archive", "--format=tar", meta["parent_commit"]], cwd=repo, stdout=subprocess.PIPE)
-    subprocess.run(["tar", "-xf", "-", "-C", str(root)], stdin=archive.stdout, check=True)
-    archive.wait()
+    _export_into(repo, commit_or_refuse(meta["parent_commit"]), root, _EXPORT_SECONDS)
     for path in root.rglob("*"):
-        os.utime(path, None)
+        os.utime(path, None, follow_symlinks=False)
     git = ["git", "-c", "user.email=mo-eval@example.invalid", "-c", "user.name=mo-eval"]
     # Initialized BEFORE the scaffold is applied: inside a customer's checkout, `git apply` would
     # otherwise resolve the patch against the enclosing repository and silently apply nothing.
-    subprocess.run([*git, "init", "-q"], cwd=root, check=True)
-    (root / ".mo-eval-scaffold.patch").write_text(package.files["scaffold.patch"])
-    subprocess.run(["git", "apply", "--whitespace=nowarn", ".mo-eval-scaffold.patch"], cwd=root, check=True)
+    _bounded(git + ["init", "-q"], cwd=root)
+    _write_without_following(root / ".mo-eval-scaffold.patch", package.files["scaffold.patch"])
+    _bounded(["git", "apply", "--whitespace=nowarn", ".mo-eval-scaffold.patch"], cwd=root, timeout=_APPLY_SECONDS)
     (root / ".mo-eval-scaffold.patch").unlink()
     _prepare_offline(root, meta)
-    for relative, content in package.local_suite.items():
-        target = root / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
-    subprocess.run([*git, "add", "-A"], cwd=root, check=True)
+    _write_all(package.local_suite, root, "local suite")
+    _bounded(git + ["add", "-A"], cwd=root)
     for artifact in _offline_artifacts(meta):
         if (root / artifact).exists():
             # Forced past .gitignore: the frozen snapshot takes tracked files, and an ignored
             # vendor/ would vanish between this tree and the worker that scores it.
-            subprocess.run([*git, "add", "-f", artifact], cwd=root, check=True)
-    subprocess.run([*git, "commit", "-q", "--no-verify", "-m", f"mo-eval start state for {package.task_id}"], cwd=root, check=True)
+            _bounded(git + ["add", "-f", artifact], cwd=root)
+    _bounded(git + ["commit", "-q", "--no-verify", "-m", f"mo-eval start state for {package.task_id}"], cwd=root)
     return root
 
 
-def _prepare_offline(root: Path, meta: dict, run=subprocess.run) -> None:
+def _prepare_offline(root: Path, meta: dict, run=None) -> None:
     """Make the start tree scorable with no network, the way its language does that.
 
     mo-eval's baseline and scorer workers have no network at all — the first live run failed on
@@ -92,26 +197,46 @@ def _prepare_offline(root: Path, meta: dict, run=subprocess.run) -> None:
     frozen tree. Runs before the evaluator-owned commit so they are part of the start state the agent
     receives and the scorer restores, not part of the agent's diff.
 
+    Vendoring is `go mod vendor`, `npm ci` and their kind — parents of resolvers and compilers, so
+    it goes through `_bounded` and its deadline takes the whole tree rather than only its root.
+
+    The command is the repository's, and what it runs is the repository's too: a Gradle preparation
+    executes the checked-out build script, at a commit the service chose. So it is given the same
+    environment a probe gets — this runner's own credentials removed — rather than the job's whole
+    environment, which carries the forge token and the pair that mints an OIDC identity.
+
     Raises:
-        subprocess.CalledProcessError: If the preparation fails; a bundle that cannot be scored
+        OrderError: If the preparation fails or does not finish. A bundle that cannot be scored
             offline must not be written as though it could.
     """
-    contract = LANGUAGES.get(meta.get("generated", {}).get("language", ""))
+    run = run or _bounded
+    contract = _contract_for(meta)
     if contract is None or not contract.offline_prepare:
         return
-    run(shlex.split(contract.offline_prepare), cwd=root, check=True, capture_output=True, text=True)
+    run(shlex.split(contract.offline_prepare), cwd=root, timeout=_OFFLINE_PREPARE_SECONDS,
+        env=_without_the_runners_credentials(os.environ, {}))
+
+
+def _contract_for(meta: dict) -> Language | None:
+    """The contract a package was generated under, including a detected variant such as `go+ginkgo`,
+    which `LANGUAGES` alone does not name."""
+    try:
+        return resolve_contract(meta.get("generated", {}).get("language", ""))
+    except KeyError:
+        return None
 
 
 def _offline_artifacts(meta: dict) -> tuple[str, ...]:
     """What the language's offline preparation leaves behind that must be tracked."""
-    contract = LANGUAGES.get(meta.get("generated", {}).get("language", ""))
+    contract = _contract_for(meta)
     return contract.offline_artifacts if contract is not None else ()
 
 
 def _repo_name(repo: Path, declared: str | None) -> str:
     if declared:
         return declared
-    url = subprocess.run(["git", "remote", "get-url", "origin"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    url = subprocess.run(["git", "remote", "get-url", "origin"], cwd=repo, capture_output=True, text=True,
+                         timeout=_GIT_SECONDS).stdout.strip()
     tail = url.removesuffix(".git").replace(":", "/").rstrip("/")
     parts = tail.split("/")
     return "/".join(parts[-2:]) if len(parts) >= 2 else tail
@@ -122,31 +247,80 @@ def _branch(repo: Path, repo_name: str) -> str:
     checked out.
 
     A CI job checks out the pushed branch, and a developer often has a feature branch out; listing
-    merged PRs against either returns nothing, silently. `origin/HEAD` names the default for any
-    clone; the forge is asked when a clone lacks it; HEAD is the last resort.
+    merged PRs against either returns nothing, silently.
     """
-    head = subprocess.run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=repo,
-                          capture_output=True, text=True).stdout.strip()
-    if head:
-        return head.split("/", 1)[-1]
+    # The forge first, and `origin/HEAD` after it. `repo_name` is what the config declares, which on
+    # a fork is the UPSTREAM — and merged pull requests are listed against that repository. A fork
+    # whose own default differs would otherwise set `--base` to its branch and list nothing, which
+    # reads as an upstream with no merged work.
     forge = subprocess.run(["gh", "repo", "view", "-R", repo_name, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
-                           cwd=repo, capture_output=True, text=True).stdout.strip()
+                           cwd=repo, capture_output=True, text=True, timeout=_FORGE_SECONDS).stdout.strip()
     if forge:
         return forge
-    return subprocess.run(["git", "symbolic-ref", "--short", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip() or "main"
+    # Then the clone's own default, then whatever is checked out.
+    head = subprocess.run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=repo,
+                          capture_output=True, text=True, timeout=_GIT_SECONDS).stdout.strip()
+    if head:
+        return head.split("/", 1)[-1]
+    return subprocess.run(["git", "symbolic-ref", "--short", "HEAD"], cwd=repo, capture_output=True,
+                          text=True, timeout=_GIT_SECONDS).stdout.strip() or "main"
 
 
 def _contract_name(repo: Path, language: str) -> str:
     """Which framework this repository actually uses, measured from its test files."""
     base = LANGUAGES[language]
-    tracked = subprocess.run(["git", "ls-files"], cwd=repo, capture_output=True, text=True).stdout.splitlines()
     contents = []
-    for path in [p for p in tracked if base.test_path.search(p)][:200]:
-        try:
-            contents.append((repo / path).read_text(errors="replace"))
-        except OSError:
-            continue
+    for path in tracked_files(repo, lambda candidate: base.test_path.search(candidate) is not None)[:200]:
+        text = bounded_text(repo / path)
+        if text is not None:
+            contents.append(text)
     return detect_framework(contents, base).name
+
+
+def asked_for(change_ids: list[str], facts: RepoFacts, candidates: int) -> list[str]:
+    """The changes the service selected, confirmed to be changes this runner offered.
+
+    The runner reads a blob per file of every id here and then runs an order for each. A service
+    that answered with more ids than were asked for — or with ids from somewhere else — would spend
+    a customer's CI on work they did not request, and the decoder's own bound is a hundred thousand.
+
+    Raises:
+        ServiceError: If the answer names more than was asked for, or a change that was not offered.
+    """
+    offered = {change.change_id for change in facts.changes}
+    unknown = [change_id for change_id in change_ids if change_id not in offered]
+    if unknown:
+        raise ServiceError(f"the service selected {len(unknown)} change(s) this repository did not offer")
+    unique = list(dict.fromkeys(change_ids))
+    if len(unique) > candidates:
+        raise ServiceError(f"the service selected {len(unique)} changes for {candidates} candidate(s)")
+    return unique
+
+
+def verdicts_asked_for(report, orders: int):
+    """The verdicts the service returned, confirmed to be one per order this runner actually ran.
+
+    Each verdict with a task attached costs a package on disk, a tree export, a vendoring step and
+    an archive held open until it uploads. Unbounded, a service can spend a CI runner's whole disk
+    answering a request for eight.
+
+    Raises:
+        ServiceError: If the answer carries more verdicts than there were orders.
+    """
+    if len(report.verdicts) > orders:
+        raise ServiceError(f"the service returned {len(report.verdicts)} verdicts for {orders} order(s)")
+    return report
+
+
+def orders_asked_for(orders: list, candidates: int) -> list:
+    """The orders the service composed, confirmed to be no more work than was requested.
+
+    Raises:
+        ServiceError: If the answer carries more orders than candidates were asked for.
+    """
+    if len(orders) > candidates:
+        raise ServiceError(f"the service returned {len(orders)} orders for {candidates} candidate(s)")
+    return orders
 
 
 def suite(arguments: argparse.Namespace) -> int:
@@ -172,16 +346,20 @@ def suite(arguments: argparse.Namespace) -> int:
     name = _repo_name(repo, config.repo)
     print(f"mo-eval-runner · {name} · {contract}")
 
-    facts = wire.crossing("up", "repo-facts", repo_facts(
+    facts = repo_facts(
         repo, repo_name=name, language=contract, test_command=config.test_command,
         branch=arguments.branch or _branch(repo, name), limit=arguments.history,
         language_contract=LANGUAGES[config.language], setup_command=config.setup_command,
-    ))
-    facts = replace(facts, worker_image=config.worker_image)
+    )
+    # Recorded after the declaration is folded in, so the audit holds what was sent rather than an
+    # earlier version of it.
+    facts = wire.crossing("up", "repo-facts", replace(facts, worker_image=config.worker_image))
     try:
         request = wire.crossing("down", "source-request", client.select(facts, arguments.candidates))
+        request = replace(request, change_ids=asked_for(request.change_ids, facts, arguments.candidates))
         sources = wire.crossing("up", "change-source", change_source(repo, facts, request.change_ids))
         response = wire.crossing("down", "work-orders", client.orders(facts, sources, arguments.candidates))
+        response = replace(response, orders=orders_asked_for(response.orders, arguments.candidates))
     except ServiceError as failure:
         print(f"service: {failure}", file=sys.stderr)
         return 1
@@ -192,14 +370,22 @@ def suite(arguments: argparse.Namespace) -> int:
         _funnel(facts, request, response, 0, VerdictReport([]), [], dry_run=True)
         return 0
     runner = Runner(repo=repo, workspaces=out / "workspaces", test_command=config.test_command,
-                    env=environment, setup_command=config.setup_command)
+                    env=environment, setup_command=config.setup_command,
+                    # Which of those names carry a credential, so the runner can take their values
+                    # out of what crosses back. `env` alone cannot say: a build flag and a token
+                    # look the same once they are merged.
+                    secret_names=tuple(config.forward_env),
+                    # The shape a probe's arguments must have. Without it the service could append
+                    # anything the repository's test tool accepts, which is more than a filter.
+                    filter_template=resolve_contract(contract).filter_template)
     results = []
     for order in orders:
         print(f"  running {order.order_id} …", flush=True)
         results.append(runner.run(order))
     wire.crossing("up", "order-results", results)
     try:
-        report = wire.crossing("down", "verdicts", client.verdicts(results))
+        report = verdicts_asked_for(wire.crossing("down", "verdicts", client.verdicts(results)),
+                                    len(results))
     except ServiceError as failure:
         print(f"service: {failure}", file=sys.stderr)
         return 1
@@ -210,24 +396,43 @@ def suite(arguments: argparse.Namespace) -> int:
         print(f"  {mark} {verdict.change_id[:9]}  {verdict.detail}")
         if verdict.task is not None:
             written.append(write_package(verdict.task, out / "tasks"))
-            bundle = write_local_suite(verdict.task, repo, out / "local-suite")
+            try:
+                bundle = write_local_suite(verdict.task, repo, out / "local-suite")
+            except (OrderError, ValueError, OSError) as failure:
+                # The task itself is already written and still valid. Only its containerized
+                # bundle could not be built, and one task's bundle failing is not the suite's end.
+                print(f"             local-suite bundle failed: {failure}", file=sys.stderr)
+                continue
             if bundle is not None:
                 print(f"             local-suite bundle → {bundle}")
 
     _funnel(facts, request, response, len(orders), report, written)
     if written and arguments.run:
         conventions = _conventions(repo, facts.repo, min(arguments.history, 120))
-        _hand_off(client, facts.repo, out, arguments.run, arguments.repeats, conventions)
+        try:
+            _hand_off(client, facts.repo, out, arguments.run, arguments.repeats, conventions)
+        except ServiceError as failure:
+            # The validated tasks are already on disk, so this is recoverable: the same hand-off is
+            # what `submit --out <dir>` does. Reported as a message and an exit code, not a traceback.
+            print(f"service: {failure}", file=sys.stderr)
+            print(f"the validated tasks are in {out}; retry the hand-off with `submit --out {out}`", file=sys.stderr)
+            return 1
     return 0 if written else 3
 
 
 def submit(arguments) -> int:
     """Hand an already-validated `--out` tree to the service for evaluation."""
-    client = client_for(arguments.service, arguments.token or os.environ.get("MO_EVAL_TOKEN"))
     conventions = None
     if arguments.conventions_from is not None:
         conventions = _conventions(Path(arguments.conventions_from), arguments.repo_name, arguments.history)
-    _hand_off(client, arguments.repo_name, Path(arguments.out), arguments.run, arguments.repeats, conventions)
+    try:
+        client = client_for(arguments.service, arguments.token or os.environ.get("MO_EVAL_TOKEN"))
+        _hand_off(client, arguments.repo_name, Path(arguments.out), arguments.run, arguments.repeats, conventions)
+    except ServiceError as failure:
+        # Reported the way `suite` reports it: a named service that cannot be reached is a message
+        # and an exit code, not a traceback.
+        print(f"service: {failure}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -263,7 +468,7 @@ def _hand_off(client, repo_name: str, out: Path, routes: list[str], repeats: int
     left on GitHub's side afterwards is nothing: the agent runs, the gateway key, and the spend all
     live on the service's side.
     """
-    import io, tarfile, urllib.request, time
+    import tarfile, tempfile, urllib.error, urllib.request, time
     suite_dir = out / "local-suite"
     bundles = sorted(p for p in suite_dir.iterdir() if p.is_dir()) if suite_dir.is_dir() else []
     if not bundles:
@@ -271,23 +476,45 @@ def _hand_off(client, repo_name: str, out: Path, routes: list[str], repeats: int
         return
     task_ids = [p.name for p in bundles]
     suite_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{task_ids[0][-8:]}"
-    targets = client.uploads(UploadRequest(repo=repo_name, suite_id=suite_id, task_ids=task_ids))
-    print(f"\n  uploading {len(task_ids)} bundle(s) for suite {suite_id}")
-    for bundle in bundles:
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
-            tar.add(bundle, arcname=bundle.name)
-        data = buffer.getvalue()
-        url = targets.urls[bundle.name]
-        if url.startswith("file://"):
-            Path(url[7:]).parent.mkdir(parents=True, exist_ok=True); Path(url[7:]).write_bytes(data)
-        elif url.startswith("memory://"):
-            pass
-        else:
-            req = urllib.request.Request(url, data=data, method="PUT", headers={"content-type": "application/gzip"})
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                resp.read()
-        print(f"    {bundle.name}  {len(data)/1e6:.1f} MB")
+    # Archived before the URLs are asked for, so the request can say how large each bundle is and
+    # the service can sign that size into the upload it authorizes. Each one goes to a file rather
+    # than a buffer: a bundle is a vendored start tree, and building it in memory costs its
+    # compressed size and then copies that — on a CI runner, the archive is what runs out.
+    archives: dict[str, Path] = {}
+    try:
+        for bundle in bundles:
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as handle:
+                archives[bundle.name] = Path(handle.name)
+            with tarfile.open(archives[bundle.name], mode="w:gz") as tar:
+                tar.add(bundle, arcname=bundle.name)
+        archive_sizes = {name: archive.stat().st_size for name, archive in archives.items()}
+        targets = client.uploads(UploadRequest(repo=repo_name, suite_id=suite_id, task_ids=task_ids, sizes=archive_sizes))
+        print(f"\n  uploading {len(task_ids)} bundle(s) for suite {suite_id}")
+        for name, archive in archives.items():
+            url = targets.urls[name]
+            if url.startswith("file://"):
+                Path(url[7:]).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(archive, url[7:])
+            elif not url.startswith("memory://"):
+                with archive.open("rb") as body:
+                    request = urllib.request.Request(
+                        url, data=body, method="PUT",
+                        headers={"content-type": "application/gzip", "content-length": str(archive_sizes[name])},
+                    )
+                    try:
+                        with urllib.request.urlopen(request, timeout=300) as response:
+                            response.read()
+                    except (urllib.error.URLError, OSError) as failure:
+                        # Storage is a different host from the service, and its failures arrive as
+                        # their own exception type — including a bare `TimeoutError` when the
+                        # response times out, which is not a `URLError`. Raised as a `ServiceError`
+                        # so both callers report a hand-off that did not happen the way they report
+                        # every other one.
+                        raise ServiceError(f"uploading {name}: {getattr(failure, 'reason', failure)}") from failure
+            print(f"    {name}  {archive_sizes[name]/1e6:.1f} MB")
+    finally:
+        for archive in archives.values():
+            archive.unlink(missing_ok=True)
     titles, categories, sizes = {}, {}, {}
     for task_id in task_ids:
         meta = out / "tasks" / task_id / "meta.json"
@@ -313,6 +540,8 @@ def _funnel(facts, request, response, ran: int, report, written: list[Path], *, 
         notes.append(f"{facts.unresolved_changes} PRs unresolvable to a parent/reference pair")
     if facts.unreadable_changes:
         notes.append(f"{facts.unreadable_changes} unreadable")
+    if facts.renaming_changes:
+        notes.append(f"{facts.renaming_changes} rename a source file, which cannot be scaffolded yet")
     if facts.source != "github-prs":
         notes.append(f"read from git log, squash merges only: {facts.source_note or 'forge not consulted'}")
     suffix = f"  ({'; '.join(notes)})" if notes else ""

@@ -16,6 +16,7 @@ claim auditable rather than asserted: after a run, `wire/` *is* the list of what
 
 from __future__ import annotations
 
+import itertools
 import json
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -85,7 +86,7 @@ class RepoFacts:
     forge: str
     """Which adapter produced this (`github`, later `gitlab`, …). The only host-specific field."""
     language: str
-    """Declared in the repository's own `.mo-eval/config.yml`."""
+    """Declared in the repository's own `.mo-eval/config.toml`."""
     test_command: str
     """The customer's declared test command. Orders may fill in ARGUMENTS to this and nothing else —
     an allow-list, so the service cannot ask the runner to execute a command of its choosing."""
@@ -124,6 +125,10 @@ class RepoFacts:
     candidate pool with no trace — the same shape as every other under-collection failure here. A
     non-zero value means the offered list is not the whole history.
     """
+    renaming_changes: int = 0
+    """Merged changes skipped because they rename a source file. A forge reports only the
+    destination path, so the scaffold would add the new file without removing the old one — and the
+    start state would then fail to compile, which the flip rule reads as a task."""
 
 
 # --- phase 2: source for selected changes only ---------------------------------------------------
@@ -293,6 +298,9 @@ class UploadRequest:
     suite_id: str
     """Identifies this mining run of this repository; the runner chooses it (a timestamp + sha)."""
     task_ids: list[str]
+    sizes: dict[str, int] = field(default_factory=dict)
+    """Bytes of each bundle, by task id. The service signs the size into the upload, so the PUT that
+    URL authorizes is the one the runner said it would make and not an arbitrary one."""
 
 
 @dataclass(frozen=True)
@@ -402,16 +410,87 @@ class ShareResponse:
 # --- decoding ------------------------------------------------------------------------------------
 
 
-def from_json(kind: type, data: Any) -> Any:
+MAX_CROSSINGS = 10_000
+"""How many exchanges one run records. A mined suite is a few hundred; past this the log has
+already said what it is for, and it shares a disk with the export it is recording."""
+
+MAX_STRING_CHARS = 16 * 1024 * 1024
+"""How long one decoded string may be. Above every field that carries a whole file, a patch or a
+rendered package, and below what costs a decoder its memory."""
+
+MAX_COLLECTION_ENTRIES = 100_000
+"""How many entries one list or object in a decoded message may carry.
+
+Counted, not sized. A per-item bound and a cap on the whole body stop neither of the shapes that
+matter here: a million minimal objects fit comfortably inside a few megabytes of JSON and become a
+million dataclasses with their own lists and dicts hanging off them. Above every real message —
+the largest suite mined so far offered 299 changes — and far below what would cost a decoder its
+memory.
+"""
+
+
+MAX_DECODED_ENTRIES = 1_000_000
+"""How many collection entries one message may decode to in total, across every level.
+
+The per-collection bound is per LEVEL, and levels multiply. `RepoFacts.changes` may hold a hundred
+thousand changes and each `ChangeFacts.files` another hundred thousand — ten billion dataclasses,
+from a body small enough to send, every one of them inside its own level's bound. Counting the whole
+decode is what turns the per-level bound into a bound on the message."""
+
+
+class _Budget:
+    """What is left of one message's decode, shared by every level of it."""
+
+    __slots__ = ("left",)
+
+    def __init__(self, left: int) -> None:
+        self.left = left
+
+    def spend(self, count: int, kind: object) -> None:
+        """Take `count` entries out of the budget.
+
+        Raises:
+            ValueError: If this message has now decoded more than one message may.
+        """
+        self.left -= count
+        if self.left < 0:
+            raise ValueError(f"decoding {kind} passes {MAX_DECODED_ENTRIES} entries for one message")
+
+
+def _bounded(count: int, kind: object) -> None:
+    """Refuse a collection larger than one message may carry."""
+    if count > MAX_COLLECTION_ENTRIES:
+        raise ValueError(f"{count} entries for {kind}; at most {MAX_COLLECTION_ENTRIES}")
+
+
+def _bounded_text(value: str, kind: object) -> str:
+    """Refuse a string larger than one field may carry.
+
+    A separate axis from the count. One entry holding a multi-gigabyte string is a message the
+    count bound never sees — and several fields here carry whole files, whole patches and whole
+    task packages, so a generous ceiling is still a ceiling.
+    """
+    if len(value) > MAX_STRING_CHARS:
+        raise ValueError(f"{len(value)} characters for {kind}; at most {MAX_STRING_CHARS}")
+    return value
+
+
+def from_json(kind: type, data: Any, _budget: _Budget | None = None) -> Any:
     """Rebuild a boundary type from the JSON `to_json` produced.
 
     Only what the wire uses: dataclasses, lists and dicts of them, optionals, and scalars. Unknown
     keys are refused rather than ignored — a runner and a service that disagree about a field should
     fail at the boundary, where the message names the field, not three stages later.
 
+    Args:
+        _budget: What is left of this message's decode. Allocated by the outermost call and passed
+            down, so nesting spends one allowance rather than a fresh one per level.
+
     Raises:
-        ValueError: If `data` does not fit `kind`.
+        ValueError: If `data` does not fit `kind`, or the whole of it decodes to more than one
+            message may carry.
     """
+    budget = _budget if _budget is not None else _Budget(MAX_DECODED_ENTRIES)
     origin = get_origin(kind)
     if origin is Union or origin is UnionType:
         members = [member for member in get_args(kind) if member is not NoneType]
@@ -419,17 +498,21 @@ def from_json(kind: type, data: Any) -> Any:
             return None
         if len(members) != 1:
             raise ValueError(f"cannot decode into {kind}")
-        return from_json(members[0], data)
+        return from_json(members[0], data, budget)
     if origin is list:
         (item,) = get_args(kind)
         if not isinstance(data, list):
             raise ValueError(f"expected a list for {kind}, got {type(data).__name__}")
-        return [from_json(item, entry) for entry in data]
+        _bounded(len(data), kind)
+        budget.spend(len(data), kind)
+        return [from_json(item, entry, budget) for entry in data]
     if origin is dict:
         _, value = get_args(kind)
         if not isinstance(data, dict):
             raise ValueError(f"expected an object for {kind}, got {type(data).__name__}")
-        return {str(key): from_json(value, entry) for key, entry in data.items()}
+        _bounded(len(data), kind)
+        budget.spend(len(data), kind)
+        return {str(key): from_json(value, entry, budget) for key, entry in data.items()}
     if is_dataclass(kind) and isinstance(kind, type):
         if not isinstance(data, dict):
             raise ValueError(f"expected an object for {kind.__name__}, got {type(data).__name__}")
@@ -441,10 +524,12 @@ def from_json(kind: type, data: Any) -> Any:
         values = {}
         for f in fields(kind):
             if f.name in data:
-                values[f.name] = from_json(hints[f.name], data[f.name])
+                values[f.name] = from_json(hints[f.name], data[f.name], budget)
             elif f.default is MISSING and f.default_factory is MISSING:
                 raise ValueError(f"{kind.__name__} is missing required field {f.name!r}")
         return kind(**values)
+    if isinstance(data, str) and kind in (str, Any):
+        return _bounded_text(data, kind)
     if kind is Any or isinstance(data, kind):
         return data
     if kind is float and isinstance(data, int):
@@ -484,6 +569,11 @@ class Wire:
         """
         if direction not in _DIRECTIONS:
             raise ValueError(f"unknown direction {direction!r}")
+        if self.sequence >= MAX_CROSSINGS:
+            # One file per exchange, and the number of exchanges follows the size of the work. The
+            # log is for reading afterwards, so it stops rather than fills the disk it shares with
+            # the export it is recording.
+            return payload
         self.sequence += 1
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / f"{self.sequence:02d}-{direction}-{name}.json"
@@ -493,7 +583,7 @@ class Wire:
     def manifest(self) -> str:
         """Render the recorded crossings as a table, newest last."""
         rows = []
-        for path in sorted(self.root.glob("*.json")):
+        for path in sorted(itertools.islice(self.root.glob("*.json"), MAX_CROSSINGS)):
             _, direction, name = path.stem.split("-", 2)
             rows.append(f"  {_DIRECTIONS[direction]:>18}  {name:<22} {path.stat().st_size:>9,} bytes")
         return "\n".join(rows)

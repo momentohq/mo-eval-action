@@ -31,7 +31,12 @@ class Language:
     test_declaration: re.Pattern[str]
     """How a test function is introduced, for counting what a change actually added."""
     test_name: re.Pattern[str]
-    """Captures the test's name in group 1, searched from the declaration line forward.
+    """Matches a test declaration; the name is the FIRST GROUP THAT CAPTURED, searched from the
+    declaration line forward.
+
+    Not group 1 specifically: a language with more than one way to declare a test needs one
+    alternative per form, and each brings its own group — Ruby has both `it "name"` and
+    `def test_name`. Callers read `next(group for group in match.groups() if group)`.
 
     Separate from `test_declaration` because the two are not always on the same line: an annotation
     language puts `@Test` above the signature, while Go and Python name the test in the declaration
@@ -40,7 +45,7 @@ class Language:
     inline_tests: bool
     """Whether unit tests live inside the files they test, requiring a syntactic boundary."""
     test_command: str
-    """What the repository would declare in `.mo-eval/config.yml` — the allow-list a probe appends to."""
+    """What the repository would declare in `.mo-eval/config.toml` — the allow-list a probe appends to."""
     filter_template: str
     """Arguments that run exactly one named test. `{name}` is the test; `{package}` is the directory
     of the file that declares it, as a `./dir` path (`.` at the root) — for ecosystems where a test
@@ -54,6 +59,12 @@ class Language:
     pattern is still declared, because "this language happens to be safe" is not something to leave
     implicit in a scorer.
     """
+    name_is_regex: bool = False
+    """Whether the runner reads `{name}` as a regular expression rather than as a literal.
+
+    Ginkgo's `--ginkgo.focus` does; Go's `-run` does too but the template anchors it. A description
+    containing `(`, `[`, `+` or `.` would otherwise match a different test, or none — and a probe
+    that matches nothing is a task that cannot be failed."""
     package_scoped: bool = False
     """Whether the test command needs a build unit named (Cargo's `-p`), rather than running from the
     repository root."""
@@ -88,13 +99,20 @@ LANGUAGES: dict[str, Language] = {
     "rust": Language(
         name="rust",
         source_suffixes=(".rs",),
-        test_path=_pattern(r"(^|/)tests?/"),
+        # A Rust test lives in `tests/`, in a file named for tests (`src/parser_tests.rs`,
+        # `src/tests.rs`), or inline behind `#[cfg(test)]`. A file of the middle kind carries no
+        # inner test module, so a contract naming only the directory reads its changes as
+        # implementation and then reports that the change wrote no test at all.
+        test_path=_pattern(r"(^|/)tests?/|(^|/)tests\.rs$|_tests?\.rs$"),
         test_declaration=_pattern(r"#\[(?:\w+::)*test\]"),
         test_name=_pattern(r"fn\s+(\w+)"),
         inline_tests=True,
         test_command="cargo test --target {host_target}",
+        # `cargo test <name>` filters by substring and cargo names no exact-match flag that works
+        # on a bare function name, so the proof is the count: a filter that also caught `name_two`
+        # reports two, and a task is graded only when the probe ran the one test it named.
         filter_template="{name}",
-        ran_a_test=r"test result: ok\. [1-9][0-9]* passed",
+        ran_a_test=r"test result: ok\. 1 passed",
         package_scoped=True,
     ),
     "go": Language(
@@ -145,8 +163,12 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r"def\s+(test_\w+)"),
         inline_tests=False,
         test_command="python -m pytest",
-        filter_template="-k {name}",
-        ran_a_test=r"[1-9][0-9]* passed",
+        # `-v` so pytest prints one node id per test, and the proof below names the node rather
+        # than counting passes. `-k test_foo` also selects `test_foobar`, so an aggregate count
+        # would let a task whose own test was deleted pass on its neighbour's result. The `\b`
+        # is what separates them: `::test_foo` does not match `::test_foobar`.
+        filter_template="-v -k {name}",
+        ran_a_test=r"::{name}\b.*PASSED",
     ),
     "typescript": Language(
         name="typescript",
@@ -156,8 +178,14 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r"""(?:it|test)\s*\(\s*['"`]([^'"`]+)"""),
         inline_tests=False,
         test_command="npx jest",
-        filter_template="-t {name}",
-        ran_a_test=r"Tests:.*[1-9][0-9]* passed",
+        # `-t` is a regular expression over a test's full name — its `describe` blocks joined to
+        # its own by spaces — so the name is escaped and anchored for the same reason Ginkgo's is:
+        # unanchored, a task about `renders a list` is also graded by `renders a list of two`, and
+        # a task whose own test is gone passes on its neighbour. Quoted in the template because it
+        # is `shlex.split` before it is filled, and shlex would otherwise eat the backslash.
+        filter_template=r"-t '(^|\s){name}$'",
+        name_is_regex=True,
+        ran_a_test=r"Tests:\s+1 passed",
     ),
     "csharp": Language(
         name="csharp",
@@ -222,7 +250,11 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r'test\s+"([^"]+)"'),
         inline_tests=False,
         test_command="mix test",
-        filter_template="--only {name}",
+        # `mix test --only` filters TAGS, not descriptions: `--only handles invalid input` selects
+        # nothing, so every probe would prove nothing and every Elixir task would be rejected for a
+        # reason that names the wrong thing. ExUnit selects a test by `file:line`, which needs a
+        # test's identity to carry where it is declared (#3973). Refused until it does.
+        filter_template="",
         ran_a_test=r"[1-9][0-9]* tests?, 0 failures",
     ),
 }
@@ -249,8 +281,22 @@ ALTERNATES: dict[str, tuple[Language, ...]] = {
             test_name=_pattern(r'^\s*(?:It|Entry|Specify)\s*\(\s*"([^"]+)"'),
             inline_tests=False,
             test_command="go test",
-            filter_template='-ginkgo.focus={name} {package}',
-            ran_a_test=r"Ran [1-9][0-9]* of",
+            # Anchored at both ends, and proven to have run ONE spec. `--ginkgo.focus` is an
+            # unanchored regex over a spec's full text — container descriptions joined to the
+            # leaf's by spaces — so a bare `handles input` also runs `handles input errors`, and a
+            # trailing `$` alone still matches `mishandles input`. A task whose own spec is missing
+            # would then be graded by its neighbour. The leaf is the tail of that text and either
+            # begins it or follows a space, which is what this says. Written `[[:space:]]` rather
+            # than a backslash class because the template is `shlex.split` before it is filled, and
+            # shlex reads a backslash as its own escape — the class would reach Ginkgo as a letter.
+            filter_template='-ginkgo.focus=(^|[[:space:]]){name}$ {package}',
+            name_is_regex=True,
+            ran_a_test=r"Ran 1 of",
+            # A variant changes how tests are found and named, not what the toolchain needs: a
+            # Ginkgo repository is a Go repository, and its bundles vendor and repair PATH the same way.
+            scorer_preamble='command -v go >/dev/null 2>&1 || export PATH="$PATH:/usr/local/go/bin:/go/bin"',
+            offline_prepare="go mod vendor",
+            offline_artifacts=("vendor",),
         ),
     ),
 }
@@ -284,7 +330,12 @@ def resolve_contract(name: str) -> Language:
         KeyError: If nothing is called that.
     """
     if name in LANGUAGES:
-        return LANGUAGES[name]
+        contract = LANGUAGES[name]
+        if not contract.filter_template:
+            # A row with no way to run one test by name cannot make a task: every probe would run
+            # the whole suite, and a probe that does not single out its test proves nothing.
+            raise KeyError(f"{name}: this contract cannot run a single test by name yet")
+        return contract
     for variants in ALTERNATES.values():
         for variant in variants:
             if variant.name == name:
