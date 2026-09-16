@@ -14,8 +14,11 @@ inputs:
       repository at a different deployment.
     default: "https://ndfq3vbnvrgbagv3vsacvuaczi0bvgaq.lambda-url.us-west-2.on.aws"
   token:
-    description: Bearer token for the service (store it as a repository secret)
-    required: true
+    description: >-
+      Bearer token for the service. Leave unset to authenticate as this repository with a GitHub
+      Actions ID token instead — the workflow then needs `permissions: id-token: write` and no secret.
+    required: false
+    default: ""
   arms:
     description: >-
       Model routes to evaluate the suite on, space-separated (one arm each). "none" builds and

@@ -339,6 +339,10 @@ class RunRequest:
     """Task id -> human title, carried so results can be read without the packages."""
     conventions: ConventionSources | None = None
     """Absent: correctness only, no conventions score."""
+    categories: dict[str, str] = field(default_factory=dict)
+    """Task id -> bug-fix | feature | refactor | performance | test-infra."""
+    sizes: dict[str, str] = field(default_factory=dict)
+    """Task id -> S | M | L."""
 
 
 @dataclass(frozen=True)
@@ -375,6 +379,24 @@ class RunSummary:
 class ResultsResponse:
     repo: str
     runs: list[RunSummary]
+
+
+# --- phase 7: sharing a run as a link -------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ShareRequest:
+    repo: str
+    run_id: str
+    ttl_hours: int = 72
+
+
+@dataclass(frozen=True)
+class ShareResponse:
+    url: str
+    """The hosted dashboard for one run: anyone with the link can read that run, nothing else,
+    until it expires. Signed with the service's own token; the token never appears in it."""
+    expires_at: str
 
 
 # --- decoding ------------------------------------------------------------------------------------

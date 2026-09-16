@@ -9,12 +9,29 @@ a runner that needs an install step before it can run one.
 from __future__ import annotations
 
 import json
+import os
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Protocol
 
 from wire import (ChangeSource, OrderResult, OrdersResponse, RepoFacts, RunRequest, RunTicket, SourceRequest,
                   UploadRequest, UploadTargets, VerdictReport, from_json, to_json)
+
+
+OIDC_AUDIENCE = "mo-eval-svc"
+
+
+def github_id_token() -> str:
+    """Ask the Actions runtime for an OIDC token naming this repository. Only a job that declared
+    `permissions: id-token: write` has the request URL and bearer in its environment."""
+    url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+    bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+    if not url or not bearer:
+        raise ServiceError("no service token, and not in a GitHub Actions job with `id-token: write`")
+    request = urllib.request.Request(f"{url}&audience={OIDC_AUDIENCE}", headers={"authorization": f"bearer {bearer}"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read())["value"]
 
 
 class ServiceError(RuntimeError):
@@ -37,6 +54,16 @@ class LocalService:
         from service.app import MemoryStore, Service  # noqa: PLC0415 - only a local runner imports the service
 
         self._service = Service(MemoryStore())
+
+    def _credential(self) -> str:
+        """The static token when one was given; otherwise a GitHub Actions ID token, minted for the
+        service's audience and renewed before it expires. The workflow needs `id-token: write`."""
+        if self._token:
+            return self._token
+        if self._minted and time.time() < self._minted_at + 240:
+            return self._minted
+        self._minted, self._minted_at = github_id_token(), time.time()
+        return self._minted
 
     def _call(self, path: str, payload: dict[str, Any]) -> Any:
         from service.app import handle  # noqa: PLC0415
@@ -66,9 +93,11 @@ class LocalService:
 class HttpService:
     """The hosted service."""
 
-    def __init__(self, base_url: str, token: str, timeout_seconds: float = 120.0) -> None:
+    def __init__(self, base_url: str, token: str | None, timeout_seconds: float = 120.0) -> None:
         self.base_url = base_url.rstrip("/")
         self._token = token
+        self._minted: str | None = None
+        self._minted_at = 0.0
         self._timeout = timeout_seconds
 
     def _call(self, path: str, payload: dict[str, Any]) -> Any:
@@ -76,7 +105,7 @@ class HttpService:
             self.base_url + path,
             data=json.dumps(payload).encode(),
             method="POST",
-            headers={"content-type": "application/json", "authorization": f"Bearer {self._token}"},
+            headers={"content-type": "application/json", "authorization": f"Bearer {self._credential()}"},
         )
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
@@ -108,6 +137,6 @@ def client_for(service: str, token: str | None) -> ServiceClient:
     """`local`, or a base URL with a bearer token."""
     if service == "local":
         return LocalService()
-    if not token:
-        raise ServiceError("a hosted service needs a token: pass --token or set MO_EVAL_TOKEN")
+    if not token and not (os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL") and os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")):
+        raise ServiceError("a hosted service needs a token (--token / MO_EVAL_TOKEN), or a GitHub Actions job with `id-token: write`")
     return HttpService(service, token)

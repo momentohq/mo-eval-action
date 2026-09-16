@@ -24,6 +24,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  id-token: write   # the job authenticates to mo-eval as this repository; no secret to manage
 jobs:
   suite:
     runs-on: ubuntu-latest
@@ -36,7 +37,6 @@ jobs:
           go-version-file: go.mod
       - uses: momentohq/mo-eval-action@v1
         with:
-          token: ${{ secrets.MO_EVAL_TOKEN }}
           arms: ${{ inputs.arms }}
 ```
 
@@ -57,7 +57,7 @@ packages and the audit log of every crossing.
 | input | default | |
 |---|---|---|
 | `service` | the hosted service | Base URL of the mo-eval service; override for another deployment |
-| `token` | — | Bearer token (a repository secret) |
+| `token` | — | Optional. Without it the job authenticates as the repository via GitHub's OIDC token (`permissions: id-token: write`); with it, a static bearer for the service |
 | `arms` | `none` | Model routes to evaluate on; `none` builds the suite without running it |
 | `history` | `300` | Merged pull requests offered as candidates |
 | `candidates` | `12` | Candidates the service is asked to source |

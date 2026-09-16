@@ -288,13 +288,19 @@ def _hand_off(client, repo_name: str, out: Path, routes: list[str], repeats: int
             with urllib.request.urlopen(req, timeout=300) as resp:
                 resp.read()
         print(f"    {bundle.name}  {len(data)/1e6:.1f} MB")
-    titles = {}
+    titles, categories, sizes = {}, {}, {}
     for task_id in task_ids:
         meta = out / "tasks" / task_id / "meta.json"
         if meta.is_file():
-            titles[task_id] = json.loads(meta.read_text()).get("title", "")
+            record = json.loads(meta.read_text())
+            titles[task_id] = record.get("title", "")
+            generated = record.get("generated", {})
+            if generated.get("category"):
+                categories[task_id] = generated["category"]
+            if generated.get("size"):
+                sizes[task_id] = generated["size"]
     ticket = client.runs(RunRequest(repo=repo_name, suite_id=suite_id, task_ids=task_ids, arms=routes, repeats=repeats,
-                                    titles=titles, conventions=conventions))
+                                    titles=titles, conventions=conventions, categories=categories, sizes=sizes))
     print(f"  run {ticket.run_id} recorded ({ticket.job_key}); results will appear under {ticket.results_prefix}")
 
 
