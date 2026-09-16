@@ -33,7 +33,6 @@ jobs:
         with: { go-version-file: go.mod }
       - uses: momentohq/mo-eval-action@v1
         with:
-          service: ${{ vars.MO_EVAL_SERVICE }}
           token: ${{ secrets.MO_EVAL_TOKEN }}
           arms: ${{ inputs.arms }}
 ```
@@ -54,7 +53,7 @@ packages and the audit log of every crossing.
 
 | input | default | |
 |---|---|---|
-| `service` | — | Base URL of the mo-eval service |
+| `service` | the hosted service | Base URL of the mo-eval service; override for another deployment |
 | `token` | — | Bearer token (a repository secret) |
 | `arms` | `none` | Model routes to evaluate on; `none` builds the suite without running it |
 | `history` | `300` | Merged pull requests offered as candidates |

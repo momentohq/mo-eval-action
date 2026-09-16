@@ -9,8 +9,10 @@ branding:
 
 inputs:
   service:
-    description: Base URL of the mo-eval service this repository is registered with
-    required: true
+    description: >-
+      Base URL of the mo-eval service. Defaults to the hosted service; override only to point a
+      repository at a different deployment.
+    default: "https://ndfq3vbnvrgbagv3vsacvuaczi0bvgaq.lambda-url.us-west-2.on.aws"
   token:
     description: Bearer token for the service (store it as a repository secret)
     required: true
