@@ -55,16 +55,6 @@ class LocalService:
 
         self._service = Service(MemoryStore())
 
-    def _credential(self) -> str:
-        """The static token when one was given; otherwise a GitHub Actions ID token, minted for the
-        service's audience and renewed before it expires. The workflow needs `id-token: write`."""
-        if self._token:
-            return self._token
-        if self._minted and time.time() < self._minted_at + 240:
-            return self._minted
-        self._minted, self._minted_at = github_id_token(), time.time()
-        return self._minted
-
     def _call(self, path: str, payload: dict[str, Any]) -> Any:
         from service.app import handle  # noqa: PLC0415
 
@@ -99,6 +89,16 @@ class HttpService:
         self._minted: str | None = None
         self._minted_at = 0.0
         self._timeout = timeout_seconds
+
+    def _credential(self) -> str:
+        """The static token when one was given; otherwise a GitHub Actions ID token, minted for the
+        service's audience and renewed before it expires. The workflow needs `id-token: write`."""
+        if self._token:
+            return self._token
+        if self._minted and time.time() < self._minted_at + 240:
+            return self._minted
+        self._minted, self._minted_at = github_id_token(), time.time()
+        return self._minted
 
     def _call(self, path: str, payload: dict[str, Any]) -> Any:
         request = urllib.request.Request(
