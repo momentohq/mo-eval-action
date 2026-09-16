@@ -1,0 +1,82 @@
+name: mo-eval suite
+description: >-
+  Mine this repository's merged pull requests into an evaluation suite, validate it with the
+  repository's own tests, and hand it to the mo-eval service to run coding agents against.
+author: Momento
+branding:
+  icon: check-square
+  color: green
+
+inputs:
+  service:
+    description: Base URL of the mo-eval service this repository is registered with
+    required: true
+  token:
+    description: Bearer token for the service (store it as a repository secret)
+    required: true
+  arms:
+    description: >-
+      Model routes to evaluate the suite on, space-separated (one arm each). "none" builds and
+      validates the suite without running anything.
+    default: "none"
+  history:
+    description: How many recently merged pull requests to offer as candidates
+    default: "300"
+  candidates:
+    description: How many candidates to request source for
+    default: "12"
+  config:
+    description: Path to the repository's mo-eval configuration, relative to the checkout
+    default: ".mo-eval/config.toml"
+  out:
+    description: Where the generated suite is written, relative to the checkout
+    default: ".mo-eval/out"
+
+runs:
+  using: composite
+  steps:
+    - name: mine and validate
+      shell: bash
+      # The runner is standard-library Python: nothing to install. It runs from the action's own
+      # checkout, so nothing of it lands in the repository being evaluated. The repository's own
+      # toolchain must already be on PATH — set it up in the workflow before this step, the same
+      # way the repository's CI does.
+      run: |
+        python3 "$GITHUB_ACTION_PATH/runner/main.py" suite \
+          --repo "$GITHUB_WORKSPACE" --config "${{ inputs.config }}" \
+          --service "${{ inputs.service }}" \
+          --history "${{ inputs.history }}" --candidates "${{ inputs.candidates }}" \
+          --out "${{ inputs.out }}" \
+          ${{ inputs.arms != 'none' && format('--run {0}', inputs.arms) || '' }}
+      env:
+        MO_EVAL_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ github.token }}   # reads this repository's merged pull requests
+
+    - name: what crossed the boundary, and what survived
+      if: always()
+      shell: bash
+      run: |
+        out="${{ inputs.out }}"
+        echo '## mo-eval suite' >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        ls -la "$out/wire" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        # An empty suite is a result to show, not a reason for this step to fail.
+        shopt -s nullglob
+        count=0
+        for meta in "$out"/tasks/*/meta.json; do
+          python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(f\"- **{m['title']}** — {len(m['generated']['test_names'])} test(s), validated={m['generated']['validated']}\")" "$meta" >> "$GITHUB_STEP_SUMMARY"
+          count=$((count + 1))
+        done
+        [ "$count" -gt 0 ] || echo '_no task survived validation — see the funnel in the job log_' >> "$GITHUB_STEP_SUMMARY"
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: mo-eval-suite
+        # The task packages and the audit log of every crossing — what was mined, and what left
+        # the runner. The runnable bundles go to the service directly and are not kept here.
+        path: |
+          ${{ inputs.out }}/tasks
+          ${{ inputs.out }}/wire
+        retention-days: 30
