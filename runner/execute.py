@@ -11,6 +11,7 @@ itself declares, so the service chooses which tests run and never what runs them
 
 from __future__ import annotations
 
+import codecs
 import os
 import re
 import shlex
@@ -20,7 +21,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from wire import OrderResult, Step, StepResult, WorkOrder
 
@@ -55,11 +56,27 @@ def _without_the_runners_credentials(inherited: Mapping[str, str], declared: dic
     credential the inherited half just removed.
     """
     return {
-        name: value
-        for source in (inherited, declared)
-        for name, value in source.items()
-        if name not in _RUNNER_CREDENTIALS
+        **_UNCOLOURED,
+        **{
+            name: value
+            for source in (inherited, declared)
+            for name, value in source.items()
+            if name not in _RUNNER_CREDENTIALS
+        },
     }
+
+
+_UNCOLOURED = {"NO_COLOR": "1", "FORCE_COLOR": "0"}
+"""Asks a test reporter not to colour its output.
+
+The proof that a test ran is a pattern over that output, and an escape sequence sits between the
+things a pattern anchors to. Vitest in a container prints the name and then `\x1b[32m 2ms`, so a
+proof anchored to the end of the line stops matching a test that plainly passed — measured on
+`hono` in `oven/bun:1`, where the same probe matches under `NO_COLOR` and does not without it.
+
+First in the mapping, so a repository that declares either one keeps its own value: a repository
+that wants colour is choosing a harder thing to match, not being overridden.
+"""
 
 
 _GROUP_EXIT_SECONDS = 30
@@ -113,7 +130,99 @@ _PROBE_TIMEOUT_SECONDS = 3600
 _SETUP_TIMEOUT_SECONDS = 1800
 
 
-def _bounded_output(argv: list[str], *, cwd, env: dict[str, str] | None, timeout: float) -> tuple[int, str]:
+_SCAN_CHUNK_BYTES = 1024 * 1024
+"""How much of a spooled output is read at once while looking for the proof pattern."""
+
+_SCAN_LINE_CHARS = 4 * 1024 * 1024
+"""How long one line may grow before it is searched without waiting for its end.
+
+A proof is a line pattern, so the scan holds a partial line until the newline that completes it. A
+command that writes no newline at all — a progress bar redrawing with a carriage return — would
+otherwise make that "partial line" the whole output, which is the bound this module exists to hold.
+"""
+
+_SCAN_OVERLAP_CHARS = _SCAN_LINE_CHARS
+"""How much of an over-long line is carried into the next read, so a match straddling the cut is
+still found. The cap's worth, not a token amount: a proof may be as long as the line it sits in —
+`::{name}\b.*PASSED` spans a whole parametrized node id — and carrying less would discard a match
+for being longer than an arbitrary window. Only reached on the over-long path; a complete line is
+carried whole and needs no overlap."""
+
+
+def _scanned(sink, *patterns: str | None) -> tuple[bool | None, ...]:
+    """Whether `pattern` occurs anywhere in the spooled output.
+
+    Read a piece at a time, because the whole of a command's output is up to the spool cap and the
+    caller is a CI job — and read at all because the evidence is usually nowhere near the end.
+
+    Searched over COMPLETE LINES, newline included, and compiled `MULTILINE` so `^` and `$` mean
+    the ends of a line — the same thing they mean to the `grep -E` the offline scorer matches the
+    same pattern with. A regular expression reads the end of a string
+    as a word boundary, so searching a piece cut mid-line would let `--- PASS: TestFoo` inside
+    `--- PASS: TestFooBar` prove that `TestFoo` ran. Cutting only at a newline keeps every boundary
+    the pattern sees a boundary the output really has. The cost is that a proof spanning lines is
+    found only when those lines land in the same read; every language contract states a line.
+
+    Leaves the position where it stopped, so a caller that still wants the tail records the end
+    first. A pattern that does not compile is the service's mistake, not this runner's, and is
+    reported as "not looked for" rather than ending the order.
+    """
+    compiled: list[re.Pattern[str] | None] = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern, re.MULTILINE) if pattern else None)
+        except re.error:
+            # Distinct from "there was no pattern": the service asked a question this runner could
+            # not read, and answering `None` would let the service fall back to reading an exit
+            # code as though it had asked nothing. Answered "not found", which is the safe way to
+            # be wrong — it loses a task rather than inventing one.
+            compiled.append(re.compile(r"(?!)"))
+    found: list[bool | None] = [None if expression is None else False for expression in compiled]
+    if not any(expression is not None for expression in compiled):
+        return tuple(found)
+    # Decoded across reads rather than per read: a multi-byte character split by the cut would
+    # otherwise become two replacement characters, and a test name carrying one could never match.
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    sink.seek(0)
+    carry = ""
+    while True:
+        chunk = sink.read(_SCAN_CHUNK_BYTES)
+        text = carry + decoder.decode(chunk, final=not chunk)
+        def look(where: str, whole: bool) -> None:
+            """Record every pattern that matches `where`. `whole` says the edges of the string are
+            edges the output really has, so a match touching one is genuine."""
+            for index, expression in enumerate(compiled):
+                if expression is None or found[index]:
+                    continue
+                match = expression.search(where)
+                if match is not None and (whole or 0 < match.start() and match.end() < len(where)):
+                    found[index] = True
+
+        if not chunk:
+            look(text, True)
+            return tuple(found)
+        settled, newline, rest = text.rpartition("\n")
+        if newline:
+            look(settled + newline, True)
+            if all(state is not False for state in found):
+                return tuple(found)
+            carry = rest
+        elif len(text) > _SCAN_LINE_CHARS:
+            # One line past the cap, so there is no newline to cut at and the line cannot be held
+            # whole. Searched where it stands, and a match touching either end is left for the next
+            # read: at those ends the string's own edge stands in for a character the output has,
+            # and `\b` reads an edge as a word boundary whether or not one is there.
+            look(text, False)
+            if all(state is not False for state in found):
+                return tuple(found)
+            carry = text[-_SCAN_OVERLAP_CHARS:]
+        else:
+            carry = text
+
+
+def _bounded_output(argv: list[str], *, cwd, env: dict[str, str] | None, timeout: float,
+                    proof: str | None = None,
+                    counterproof: str | None = None) -> tuple[int, str, bool | None, bool | None]:
     """Run a command and return its exit code and the tail of what it wrote.
 
     The output is written to a temporary file and only the tail is read back. `capture_output`
@@ -146,10 +255,17 @@ def _bounded_output(argv: list[str], *, cwd, env: dict[str, str] | None, timeout
             # Checked on the way out as well as while waiting: a command can write its whole flood
             # inside one polling interval and exit, and the disk is just as full either way.
             raise OrderError(f"the command wrote more than {_MAX_SPOOLED_BYTES} bytes of output")
+        # Where the output ends, recorded before the scan below moves the position — taken after it,
+        # a scan that stopped at its match would make the "tail" a slice out of the middle.
+        end = sink.tell()
+        # Searched over the WHOLE spool, before the tail is cut. The evidence that a test ran is
+        # often far from the end — a coverage table, a workspace of test binaries — and once the
+        # tail is taken it is gone.
+        seen, failed = _scanned(sink, proof, counterproof)
         # Read a little more than the tail so the caller can redact across the cut before it
         # truncates: a credential straddling the boundary would otherwise keep its surviving half.
-        sink.seek(max(0, sink.tell() - (_OUTPUT_TAIL_BYTES + _REDACTION_OVERLAP_BYTES)))
-        return child.returncode, sink.read().decode(errors="replace")
+        sink.seek(max(0, end - (_OUTPUT_TAIL_BYTES + _REDACTION_OVERLAP_BYTES)))
+        return child.returncode, sink.read().decode(errors="replace"), seen, failed
 
 
 def _wait_within(child: subprocess.Popen, sink, timeout: float) -> None:
@@ -283,7 +399,22 @@ def _fills(part: str, argument: str) -> bool:
         r"(?!-).*" if piece in ("{name}", "{package}") else re.escape(piece)
         for piece in re.split(r"(\{name\}|\{package\})", part)
     )
-    return re.fullmatch(pattern, argument, re.DOTALL) is not None
+    if re.fullmatch(pattern, argument, re.DOTALL) is None:
+        return False
+    # A part that IS the package placeholder is a path into the exported tree, and a path is read by
+    # more tools than a selector is. `pytest` treats `@file` as a list of further options and
+    # selectors to apply, so a repository owning a file called `@opts.py` would be naming flags
+    # rather than a file — and these same arguments are what the generated scorer runs in the lane,
+    # which is shared. Absolute paths and `..` are refused for the same reason the order id is: the
+    # runner holds its own boundary rather than trusting what composed the order.
+    return part != "{package}" or _within_the_tree(argument)
+
+
+def _within_the_tree(argument: str) -> bool:
+    """Whether a path argument stays inside the exported tree and names a path rather than a flag."""
+    if argument.startswith(("-", "@", "/", "~")):
+        return False
+    return not any(segment == ".." for segment in PurePosixPath(argument).parts)
 
 
 def _expand(command: str) -> list[str]:
@@ -440,7 +571,7 @@ class Runner:
         """
         if self.setup_command is None:
             return self._result(step, 0, started, "no setup command declared")
-        exit_code, tail = _bounded_output(
+        exit_code, tail, _, _ = _bounded_output(
             shlex.split(self.setup_command), cwd=workspace,
             env=self._test_environment, timeout=self._within_deadline(_SETUP_TIMEOUT_SECONDS),
         )
@@ -483,8 +614,9 @@ class Runner:
         budget = self._within_deadline(_PROBE_TIMEOUT_SECONDS)
         command = [*_expand(self.test_command), *arguments]
         try:
-            exit_code, tail = _bounded_output(
+            exit_code, tail, seen, failed = _bounded_output(
                 command, cwd=directory, env=self._test_environment, timeout=budget,
+                proof=step.proof, counterproof=step.counterproof,
             )
         except subprocess.TimeoutExpired:
             if time.monotonic() >= self._deadline:
@@ -492,8 +624,13 @@ class Runner:
                 # read as a test that hung — a verdict about the repository rather than about this
                 # runner having stopped, and `run` would report no error at all.
                 raise
-            return self._result(step, 124, started, "probe timed out")
-        return self._result(step, exit_code, started, tail)
+            # A probe that did not finish proves nothing, and says so rather than leaving the
+            # service to read a timeout's exit code as a test that failed. Reported only where a
+            # pattern was carried, so a runner asked nothing still answers nothing.
+            return self._result(step, 124, started, "probe timed out",
+                                proof_seen=False if step.proof else None,
+                                counterproof_seen=False if step.counterproof else None)
+        return self._result(step, exit_code, started, tail, seen, failed)
 
     def _filter_or_refuse(self, arguments: list[str]) -> list[str]:
         """Probe arguments, confirmed to be a test filter and not a different command.
@@ -542,12 +679,15 @@ class Runner:
             raise OrderError(f"probe directory does not exist: {relative!r}")
         return resolved
 
-    def _result(self, step: Step, exit_code: int, started: float, tail: str) -> StepResult:
+    def _result(self, step: Step, exit_code: int, started: float, tail: str,
+                proof_seen: bool | None = None, counterproof_seen: bool | None = None) -> StepResult:
         return StepResult(
             step_id=step.step_id,
             exit_code=exit_code,
             duration_seconds=round(time.monotonic() - started, 2),
             output_tail=self._reported(tail),
+            proof_seen=proof_seen,
+            counterproof_seen=counterproof_seen,
         )
 
     def _reported(self, output: str) -> str:

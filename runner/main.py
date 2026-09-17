@@ -145,7 +145,7 @@ def _bounded(argv: list[str], *, cwd: Path, timeout: float = _GIT_SECONDS,
     """
     named = " ".join(argv[:2])
     try:
-        exit_code, tail = _bounded_output(argv, cwd=cwd, env=env, timeout=timeout)
+        exit_code, tail, _, _ = _bounded_output(argv, cwd=cwd, env=env, timeout=timeout)
     except subprocess.TimeoutExpired as expired:
         raise OrderError(f"{named} did not finish within {timeout:.0f}s") from expired
     if exit_code != 0:
@@ -266,15 +266,16 @@ def _branch(repo: Path, repo_name: str) -> str:
                           text=True, timeout=_GIT_SECONDS).stdout.strip() or "main"
 
 
-def _contract_name(repo: Path, language: str) -> str:
-    """Which framework this repository actually uses, measured from its test files."""
+def _contract_name(repo: Path, language: str, test_command: str = "") -> str:
+    """Which framework this repository actually uses, measured from its test files and from the
+    command it declared it runs them with."""
     base = LANGUAGES[language]
     contents = []
     for path in tracked_files(repo, lambda candidate: base.test_path.search(candidate) is not None)[:200]:
         text = bounded_text(repo / path)
         if text is not None:
             contents.append(text)
-    return detect_framework(contents, base).name
+    return detect_framework(contents, base, test_command).name
 
 
 def asked_for(change_ids: list[str], facts: RepoFacts, candidates: int) -> list[str]:
@@ -342,7 +343,7 @@ def suite(arguments: argparse.Namespace) -> int:
 
     out = arguments.out.resolve()
     wire = Wire(root=out / "wire")
-    contract = _contract_name(repo, config.language)
+    contract = _contract_name(repo, config.language, config.test_command)
     name = _repo_name(repo, config.repo)
     print(f"mo-eval-runner · {name} · {contract}")
 
@@ -410,7 +411,8 @@ def suite(arguments: argparse.Namespace) -> int:
     if written and arguments.run:
         conventions = _conventions(repo, facts.repo, min(arguments.history, 120))
         try:
-            _hand_off(client, facts.repo, out, arguments.run, arguments.repeats, conventions)
+            _hand_off(client, facts.repo, out, routes=arguments.run, repeats=arguments.repeats,
+                      conventions=conventions, harnesses=arguments.harnesses)
         except ServiceError as failure:
             # The validated tasks are already on disk, so this is recoverable: the same hand-off is
             # what `submit --out <dir>` does. Reported as a message and an exit code, not a traceback.
@@ -427,7 +429,8 @@ def submit(arguments) -> int:
         conventions = _conventions(Path(arguments.conventions_from), arguments.repo_name, arguments.history)
     try:
         client = client_for(arguments.service, arguments.token or os.environ.get("MO_EVAL_TOKEN"))
-        _hand_off(client, arguments.repo_name, Path(arguments.out), arguments.run, arguments.repeats, conventions)
+        _hand_off(client, arguments.repo_name, Path(arguments.out), routes=arguments.run,
+                  repeats=arguments.repeats, conventions=conventions, harnesses=arguments.harnesses)
     except ServiceError as failure:
         # Reported the way `suite` reports it: a named service that cannot be reached is a message
         # and an exit code, not a traceback.
@@ -460,7 +463,8 @@ def _recent_merged(repo: Path, repo_name: str, limit: int) -> list[int]:
 
 
 def _hand_off(client, repo_name: str, out: Path, routes: list[str], repeats: int,
-              conventions: ConventionSources | None = None) -> None:
+              conventions: ConventionSources | None = None,
+              harnesses: list[str] | None = None) -> None:
     """Upload every validated bundle to the service's storage and record a run for the lane.
 
     The bundles are tarred here and PUT to presigned URLs, so the service never receives the bytes
@@ -526,8 +530,11 @@ def _hand_off(client, repo_name: str, out: Path, routes: list[str], repeats: int
                 categories[task_id] = generated["category"]
             if generated.get("size"):
                 sizes[task_id] = generated["size"]
-    ticket = client.runs(RunRequest(repo=repo_name, suite_id=suite_id, task_ids=task_ids, arms=routes, repeats=repeats,
-                                    titles=titles, conventions=conventions, categories=categories, sizes=sizes))
+    # No harness named stays unnamed all the way to the service, which is what decides what that
+    # means — rather than a default here to drift from it, or a key in a request that predates it.
+    ticket = client.runs(RunRequest(repo=repo_name, suite_id=suite_id, task_ids=task_ids, arms=routes,
+                                    repeats=repeats, titles=titles, conventions=conventions,
+                                    categories=categories, sizes=sizes, harnesses=harnesses))
     print(f"  run {ticket.run_id} recorded ({ticket.job_key}); results will appear under {ticket.results_prefix}")
 
 
@@ -585,6 +592,8 @@ def main() -> int:
     s.add_argument("--dry-run", action="store_true", help="stop after orders are issued; run nothing")
     s.add_argument("--run", nargs="*", metavar="ROUTE", default=None,
                    help="after validating, upload the bundles and ask the service to evaluate them on these model routes")
+    s.add_argument("--harnesses", nargs="+", metavar="NAME", default=None,
+                   help="client harnesses to compare, each against every route: mo, cc, or both (default: mo)")
     s.add_argument("--repeats", type=int, default=1)
     s.set_defaults(command_fn=suite)
     m = commands.add_parser("submit", help="upload an already-validated --out tree and ask the service to evaluate it")
@@ -592,7 +601,10 @@ def main() -> int:
     m.add_argument("--repo-name", required=True, help="owner/name the suite was mined from")
     m.add_argument("--service", required=True)
     m.add_argument("--token", default=None, help="bearer token, else $MO_EVAL_TOKEN")
-    m.add_argument("--run", nargs="+", metavar="ROUTE", required=True, help="model routes, one arm each")
+    m.add_argument("--run", nargs="+", metavar="ROUTE", required=True,
+                   help="model routes, each paired with every harness")
+    m.add_argument("--harnesses", nargs="+", metavar="NAME", default=None,
+                   help="client harnesses to compare, each against every route: mo, cc, or both (default: mo)")
     m.add_argument("--repeats", type=int, default=1)
     m.add_argument("--conventions-from", metavar="REPO", default=None,
                    help="a checkout to collect convention sources from (contributing guide, lint config, review comments)")

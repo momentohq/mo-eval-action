@@ -23,7 +23,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from languages import Language
-from wire import ChangeFacts, ChangeSource, FileFacts, FileSource, RepoFacts
+from wire import PROTOCOL, ChangeFacts, ChangeSource, FileFacts, FileSource, RepoFacts
 
 _NUMSTAT = re.compile(r"^(\d+|-)\t(\d+|-)\t(.+)$")
 _PACKAGE_NAME = re.compile(r'^\s*name\s*=\s*"([^"]+)"', re.MULTILINE)
@@ -303,6 +303,7 @@ def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
         test_command=str(named["test_command"]), changes=changes,
         setup_command=named["setup_command"],  # type: ignore[arg-type]
         source="github-prs", unresolved_changes=unresolved, renaming_changes=renaming,
+        protocol=PROTOCOL,
     )
 
 
@@ -487,7 +488,7 @@ def _facts_from_git_log(repo: Path, **named: object) -> RepoFacts:
         repo=str(named["repo_name"]), forge="github", language=str(named["language"]),
         test_command=str(named["test_command"]), changes=changes,
         setup_command=named["setup_command"],  # type: ignore[arg-type]
-        source="git-log", unreadable_changes=unreadable,
+        source="git-log", unreadable_changes=unreadable, protocol=PROTOCOL,
     )
 
 

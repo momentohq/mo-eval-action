@@ -125,6 +125,15 @@ class RepoFacts:
     candidate pool with no trace — the same shape as every other under-collection failure here. A
     non-zero value means the offered list is not the whole history.
     """
+    protocol: int = 0
+    """Which revision of this protocol the runner speaks; 0 is a runner that does not say.
+
+    Read by the service to decide whether a field it could send is one this runner can receive. The
+    published Action vendors its own copy of these types and `from_json` refuses an unknown key, so
+    a new field in an order breaks every runner published before it — not at the field, but at the
+    whole order. The service learns the value before any runner sends it: deploy the service, then
+    publish the Action, then move the pin.
+    """
     renaming_changes: int = 0
     """Merged changes skipped because they rename a source file. A forge reports only the
     destination path, so the scaffold would add the new file without removing the old one — and the
@@ -205,6 +214,28 @@ class Step:
     A path inside the exported tree, which the runner enforces; it is not a way to reach a command
     elsewhere on the machine.
     """
+    proof: str | None = None
+    """`probe`: a regular expression whose presence in the output means the named test really ran.
+
+    Sent because only the runner sees the whole of a command's output. The tail that comes back is
+    bounded, and a reporter that prints more than that after its summary — a coverage table, a
+    workspace of test binaries — pushes the evidence out of it, so the service would read a test that
+    ran and passed as one that never ran at all.
+
+    It tells the runner nothing it could use: the pattern says what "ran" looks like, never which way
+    the probe is supposed to go. Sent only to a runner whose `RepoFacts.protocol` says it can read
+    one; an older runner gets an order without the key and the service falls back to the tail.
+    """
+    counterproof: str | None = None
+    """`probe`: a regular expression whose presence in the output means the named test ran and FAILED.
+
+    The other half of `proof`, and sent for the other half of the question. A start state earns a
+    task by FAILING, and read from an exit code alone that is true of a tree that did not compile
+    and of a neighbouring test the filter also caught. This says what the named test failing looks
+    like, and — like `proof` — says nothing about which way the probe is supposed to go.
+
+    Sent only to a runner whose `RepoFacts.protocol` is high enough to receive one.
+    """
     args: list[str] | None = None
     """`probe`: arguments APPENDED to the repository's own declared `test_command`.
 
@@ -234,6 +265,18 @@ class StepResult:
     duration_seconds: float
     output_tail: str
     """Bounded trailing output. Diagnostic for the operator; the verdict is the exit code."""
+    proof_seen: bool | None = None
+    """Whether `Step.proof` was found anywhere in the output, not only in the tail above.
+
+    `None` when the step carried no pattern — and therefore whenever the step came from a runner
+    that predates it, since the service does not send a pattern to one. Left out of the JSON
+    entirely when it is `None`, so a result from a newer runner still decodes against an older
+    service. The service then falls back to searching the tail, as it did before this field existed.
+    """
+    counterproof_seen: bool | None = None
+    """Whether `Step.counterproof` was found anywhere in the output, on the same terms as
+    `proof_seen`. `None` when the step carried no such pattern, and the service then reads the
+    step's exit code, which is what it did before this field existed."""
 
 
 @dataclass(frozen=True)
@@ -341,8 +384,16 @@ class RunRequest:
     suite_id: str
     task_ids: list[str]
     arms: list[str]
-    """Model routes, one arm each (`anthropic/claude-opus-5`, `momento/zai-org/GLM-5.3`)."""
+    """Model routes (`anthropic/claude-opus-5`, `momento/zai-org/GLM-5.3`), each paired with every
+    harness named below."""
     repeats: int = 1
+    harnesses: list[str] | None = None
+    """Client harnesses to compare: `mo`, `cc`, or both — the service refuses a name it cannot run.
+
+    `None` rather than a default of `["mo"]`, so a caller who names no harness sends no value to
+    distinguish: `to_json` omits a `None` field, an omitted key and a null one decode alike, and the
+    service decides what naming none means. A default here would instead put the key in every
+    request a new runner sends, which a service predating the field refuses whole."""
     titles: dict[str, str] = field(default_factory=dict)
     """Task id -> human title, carried so results can be read without the packages."""
     conventions: ConventionSources | None = None
@@ -428,6 +479,20 @@ the largest suite mined so far offered 299 changes — and far below what would 
 memory.
 """
 
+
+PROTOCOL = 2
+"""The revision of this protocol the copy of these types in THIS tree speaks.
+
+Sent by the runner as `RepoFacts.protocol` so the service knows which fields it may put in an order.
+Raised when a field is added that an older runner would refuse to decode — which is any field at
+all, since unknown keys are refused. The published Action vendors this file, so the number it sends
+is the number that shipped with it.
+
+1. `Step.proof` and `StepResult.proof_seen`: the proof that a test ran, searched over the whole of
+   a probe's output rather than the tail that comes back.
+2. `Step.counterproof` and `StepResult.counterproof_seen`: the same for a test that ran and FAILED,
+   which is what a start state has to do to earn a task.
+"""
 
 MAX_DECODED_ENTRIES = 1_000_000
 """How many collection entries one message may decode to in total, across every level.
@@ -590,9 +655,26 @@ class Wire:
 
 
 def to_json(value: Any) -> Any:
-    """Convert dataclasses (and containers of them) to plain JSON-compatible values."""
+    """Convert dataclasses (and containers of them) to plain JSON-compatible values.
+
+    A field holding `None` is left out — but only where its default is `None`, which is exactly when
+    leaving it out and sending it as null decode the same. A field typed `X | None` with no default
+    is still REQUIRED, and omitting it would make the message unreadable rather than compatible:
+    `FileFacts.package` is one.
+
+    Left out at all because `from_json` refuses a key it does not know, so every field this side
+    adds is otherwise a key the other side has never heard of — and the other side here is a GitHub
+    Action, published and pinned by version, running in a customer's CI.
+    """
     if is_dataclass(value) and not isinstance(value, type):
-        return asdict(value)
+        # Field by field rather than `asdict`, which converts the whole tree in one go: it would
+        # turn a nested dataclass into a dict before anything here could look at it, and the
+        # omission below would then apply only to the outermost object. Production sends nested
+        # ones — a `WorkOrder` of `Step`s, an `OrderResult` of `StepResult`s — so an `asdict` here
+        # leaves every new field in every nested object on the wire as a null.
+        return {field.name: to_json(getattr(value, field.name))
+                for field in fields(value)
+                if getattr(value, field.name) is not None or field.default is not None}
     if isinstance(value, list):
         return [to_json(item) for item in value]
     if isinstance(value, dict):

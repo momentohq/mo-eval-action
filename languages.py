@@ -53,6 +53,11 @@ class Language:
     ran_a_test: str
     """Regex proving at least one test actually EXECUTED, with `{name}` available.
 
+    A LINE pattern. Matched against the probe's output compiled `MULTILINE`, and against the same
+    output by `grep -E` in the offline scorer, so `^` and `$` mean the ends of a line in both and a
+    construct only one engine knows — a lookahead — passes validation and then fails every task in
+    the lane.
+
     Load-bearing, and different in every ecosystem. `cargo test` and `go test` both exit **zero** when
     a filter matches nothing, so an oracle reading only the exit code would grade a task that cannot
     be failed. `pytest` exits 5 and Gradle fails outright, so there the exit code is enough — but the
@@ -78,6 +83,40 @@ class Language:
     (`vendor/`). They must be force-tracked in the start commit: mo-eval's snapshotter freezes
     tracked and non-ignored files only, so an ignored `vendor/` silently never reaches the
     workers — and the baseline "fails" on a module fetch instead of on the task."""
+    failed_a_test: str = ""
+    """Regex proving the NAMED test ran and FAILED, with `{name}` available. A line pattern, like
+    `ran_a_test`, and matched the same two ways.
+
+    The start state is where a task's claim lives: a test that fails there and passes at the
+    reference is the flip the mining looks for. Read from an exit code alone that claim is wrong
+    whenever the command failed for a reason that is not the test — a start tree that does not
+    compile, or a neighbouring test the substring filter also selected. Both produce a non-zero exit
+    with the named test never having run.
+
+    `ran_a_test` cannot answer it: that pattern proves a test ran and PASSED, which is exactly what
+    the start state should not do. Hence a second pattern, for what the ecosystem prints when the
+    named test ran and failed.
+
+    Empty for a contract whose failure wording has not been measured. The judge then reads the exit
+    code, which is what it did before this existed — no better, and no worse.
+    """
+    scope_is_test_file: bool = False
+    """Whether `{package}` means the test's own FILE rather than the directory holding it.
+
+    `pytest` collects everything it is pointed at before it filters, so a probe that names no path
+    imports the whole suite to run one test. One unrelated file that cannot be imported then fails
+    every task in the repository — measured on `sqlglot`, where three test modules needing an
+    optional dependency ended the run at `3 errors during collection` while the task's own test was
+    fine. Naming the file also narrows what `-k` can reach: the same probe collected three matching
+    tests across the suite and two within the file.
+    """
+    command_marker: str = ""
+    """A word in the repository's declared test command that selects this contract over its siblings.
+
+    Detection is otherwise by counting test declarations, which cannot separate two frameworks that
+    write tests the same way and differ only in what runs them: Jest and Vitest are both `it(` and
+    `test(`, and a repository says which it uses by declaring `npx vitest run`. A contract naming a
+    marker is chosen only when the marker is in that command, and never by counting."""
     scorer_preamble: str = ""
     """Shell lines the generated scorer runs first — environment the language's toolchain needs that a
     scoring shell may not provide. Kept per language rather than per repository: it is a fact about
@@ -108,11 +147,26 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r"fn\s+(\w+)"),
         inline_tests=True,
         test_command="cargo test --target {host_target}",
-        # `cargo test <name>` filters by substring and cargo names no exact-match flag that works
-        # on a bare function name, so the proof is the count: a filter that also caught `name_two`
-        # reports two, and a task is graded only when the probe ran the one test it named.
+        # `cargo test <name>` filters by substring and cargo names no exact-match flag that works on
+        # a bare function name, so the filter stays a substring and the PROOF carries the identity:
+        # libtest prints one line per test, and `test roff::required_group ... ok` names which of
+        # the six tests that substring ran. Counting could not — `required_group` also selects
+        # `required_group_with_required_option`, so `clap` reported two passes and the probe read as
+        # a test that never ran. The optional path segment is what libtest prefixes for a test in a
+        # module, and `- should panic` is what libtest appends for a `#[should_panic]` test that
+        # passed. Written `(\S+::)?` rather than a bracket class: `[^ ]` includes a newline in
+        # Python and not in `grep`, and the offline scorer matches this same pattern with `grep -E`
+        # — which also has no `(?:`, so the group is a capturing one.
+        #
+        # Two things it does not settle. A same-named test in another module of the same package
+        # satisfies it, because a bare name is not an identity (#3973); the count it replaces
+        # refused that case instead of grading it, so this trades a lost task for a possibly
+        # misattributed one, and the identity work is what closes it. And a repository that declares
+        # `--nocapture` interleaves a test's own output between the name and its status, which no
+        # line pattern can follow.
         filter_template="{name}",
-        ran_a_test=r"test result: ok\. 1 passed",
+        ran_a_test=r"^test (\S+::)?{name}( - should panic)? \.\.\. ok$",
+        failed_a_test=r"^test (\S+::)?{name}( - should panic)? \.\.\. FAILED$",
         package_scoped=True,
     ),
     "go": Language(
@@ -125,6 +179,7 @@ LANGUAGES: dict[str, Language] = {
         test_command="go test",
         filter_template="-v -run ^{name}$ {package}",
         ran_a_test=r"--- PASS: {name}\b",
+        failed_a_test=r"--- FAIL: {name}\b",
         # A login shell (`sh -lc`, which mo-eval's local-suite workers use) sources /etc/profile,
         # which resets PATH to the Debian default and drops /usr/local/go/bin — so `go` is "not
         # found" in the very image that ships it, and a baseline "fails" for a reason that is not
@@ -167,8 +222,16 @@ LANGUAGES: dict[str, Language] = {
         # than counting passes. `-k test_foo` also selects `test_foobar`, so an aggregate count
         # would let a task whose own test was deleted pass on its neighbour's result. The `\b`
         # is what separates them: `::test_foo` does not match `::test_foobar`.
-        filter_template="-v -k {name}",
+        filter_template="-v {package} -k {name}",
+        scope_is_test_file=True,
         ran_a_test=r"::{name}\b.*PASSED",
+        # No failure wording, so the start state is read from the exit code. `pytest` reports a
+        # unittest subtest failure on its own lines and still prints `::{name} PASSED` for the test
+        # that owns them, so both halves of a by-name reading are wrong here at once: nothing says
+        # the test failed, and the line that says it passed is not true. Measured on `sqlglot`'s
+        # `5dea55713`, whose `test_identity` fails fifteen subtests at the start state — a real task
+        # that a by-name reading refuses. Tracked as #4057.
+        failed_a_test="",
     ),
     "typescript": Language(
         name="typescript",
@@ -185,7 +248,11 @@ LANGUAGES: dict[str, Language] = {
         # is `shlex.split` before it is filled, and shlex would otherwise eat the backslash.
         filter_template=r"-t '(^|\s){name}$'",
         name_is_regex=True,
-        ran_a_test=r"Tests:\s+1 passed",
+        # Both wordings: Jest prints `Tests:       1 passed, 1 total` and Vitest prints
+        # `Tests  1 passed | 5192 skipped (5193)` — same filter flag, same anchoring, different
+        # summary line. Measured against hono, which is Vitest; the colon alone made every probe
+        # read as "no test ran", which rejects a whole repository for its reporter's punctuation.
+        ran_a_test=r"Tests:?\s+1 passed",
     ),
     "csharp": Language(
         name="csharp",
@@ -272,6 +339,32 @@ LANGUAGES: dict[str, Language] = {
 # or list a framework used by one legacy directory; the files cannot.
 
 ALTERNATES: dict[str, tuple[Language, ...]] = {
+    "typescript": (
+        Language(
+            name="typescript+vitest",
+            source_suffixes=(".ts", ".tsx"),
+            test_path=_pattern(r"\.(test|spec)\.tsx?$|(^|/)__tests__/|(^|/)test/"),
+            test_declaration=_pattern(r"^\s*(?:it|test)\s*\("),
+            test_name=_pattern(r"""(?:it|test)\s*\(\s*['"`]([^'"`]+)"""),
+            inline_tests=False,
+            test_command="npx vitest run",
+            command_marker="vitest",
+            # `--reporter=verbose` so Vitest prints one line per test, and the proof below names the
+            # test rather than counting passes. A count cannot tell "three tests matched" from "one
+            # test, three times": a Vitest config may declare several projects, and `hono` declares
+            # three, so its one selected test reports `Tests  3 passed` and read as a count says
+            # nothing ran. The `✓` is what makes the line a pass rather than a listing, and the
+            # lookahead is what stops `renders a list` matching `renders a list of two` — written as
+            # Anchored at the end of the line, past the duration the reporter appends, because
+            # `renders a list` is otherwise proven by `renders a list of two` — a space follows the
+            # name either way. Not a lookahead: the offline scorer matches this same pattern with
+            # `grep -E`, which has none.
+            filter_template=r"--reporter=verbose -t '(^|\s){name}$'",
+            name_is_regex=True,
+            ran_a_test=r"✓.*> {name}( [0-9.]+m?s)?$",
+            failed_a_test=r"×.*> {name}( [0-9.]+m?s)?$",
+        ),
+    ),
     "go": (
         Language(
             name="go+ginkgo",
@@ -302,12 +395,14 @@ ALTERNATES: dict[str, tuple[Language, ...]] = {
 }
 
 
-def detect_framework(test_file_contents: list[str], language: Language) -> Language:
+def detect_framework(test_file_contents: list[str], language: Language, test_command: str = "") -> Language:
     """Pick the contract that actually matches this repository's tests.
 
     Args:
         test_file_contents: Contents of the repository's test files.
         language: The language's default contract.
+        test_command: What the repository declared it runs its tests with. Read by a contract that
+            names a `command_marker`, because two frameworks can write tests identically.
 
     Returns:
         Whichever candidate contract matches the most test files, defaulting to `language` when
@@ -315,8 +410,15 @@ def detect_framework(test_file_contents: list[str], language: Language) -> Langu
         declared contract, not under one guessed for it.
     """
     candidates = (language, *ALTERNATES.get(language.name, ()))
+    named = [c for c in candidates if c.command_marker and c.command_marker in test_command]
+    if named:
+        return named[0]
     best, best_score = language, 0
     for candidate in candidates:
+        if candidate.command_marker:
+            # Its own command did not name it, and counting declarations cannot reach it — the
+            # sibling it would be confused with writes tests identically.
+            continue
         score = sum(1 for content in test_file_contents if candidate.test_declaration.search(content))
         if score > best_score:
             best, best_score = candidate, score
