@@ -12,7 +12,7 @@ inputs:
     description: >-
       Base URL of the mo-eval service. Defaults to the hosted service; override only to point a
       repository at a different deployment.
-    default: "https://ndfq3vbnvrgbagv3vsacvuaczi0bvgaq.lambda-url.us-west-2.on.aws"
+    default: "https://evals.gomomento.ai"
   token:
     description: >-
       Bearer token for the service. Leave unset to authenticate as this repository with a GitHub
