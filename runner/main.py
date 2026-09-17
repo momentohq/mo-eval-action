@@ -204,6 +204,13 @@ def write_local_suite(package: TaskPackage, repo: Path, into: Path,
     return root
 
 
+_PREPARE_HOME = "/tmp"
+"""HOME inside the preparation container: somewhere the runner's uid may actually write.
+
+Deliberately NOT under the mounted tree — a toolchain cache is not part of a task's start state, and
+anything left there would be frozen into the bundle and shipped to every worker.
+"""
+
 _OFFLINE_PREPARE_MAX_PIDS = 2048
 """How many processes a preparation may have at once.
 
@@ -346,7 +353,18 @@ def _prepare_offline(root: Path, meta: dict, run=None, config: RunnerConfig | No
                  # real vendoring — `pip wheel`, `cargo vendor` and `bun install` spawn tens of
                  # processes, not thousands — so it costs a legitimate repository nothing.
                  "--pids-limit", str(_OFFLINE_PREPARE_MAX_PIDS),
+                 # The runner's own uid, so what is vendored is owned by whoever has to read it
+                 # afterwards rather than by root. That uid has no entry in the image's passwd file,
+                 # so HOME resolves to `/` — which nothing may write — and every toolchain puts its
+                 # cache under HOME: Go's build cache, `$CARGO_HOME`, pip's, npm's, bun's. Go is
+                 # simply the one that refuses to start without it:
+                 #
+                 #     failed to initialize build cache at /.cache/go-build: mkdir /.cache: denied
+                 #
+                 # So every Go bundle failed to build on any runner that is not root, which is every
+                 # GitHub Actions runner (#4137). One writable HOME answers all of them at once.
                  "--user", f"{os.getuid()}:{os.getgid()}",
+                 "-e", f"HOME={_PREPARE_HOME}",
                  "-v", f"{root}:/mo-eval-tree", "-w", "/mo-eval-tree", "--entrypoint", "sh",
                  image, "-c", prepare],
                 cwd=root, timeout=_OFFLINE_PREPARE_SECONDS,
