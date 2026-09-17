@@ -16,7 +16,7 @@ out of the path, and `split.py` already has that branch.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -100,6 +100,38 @@ class Language:
     Empty for a contract whose failure wording has not been measured. The judge then reads the exit
     code, which is what it did before this existed — no better, and no worse.
     """
+    vendoring_replaces_setup: bool = False
+    """Whether vendoring makes the repository's setup command unnecessary rather than offline-able.
+
+    `node_modules` IS the install: with it in the tree there is nothing left to do, and running
+    `bun install --frozen-lockfile` offline fails outright — measured, `DNSResolveFailed downloading
+    tarball color-name@1.1.3`, even with a complete `node_modules` present. Whereas `pip install -e .`
+    also builds and links the project itself, so Python keeps its setup and is merely pointed at the
+    wheels.
+
+    Safe to decide from the contract alone: a bundle only exists for such a repository when something
+    vendored, because a repository that declares a setup command and no vendoring is refused before a
+    bundle is written.
+    """
+    resolves_dependencies_when_testing: bool = False
+    """Whether running the tests itself reaches for dependencies, rather than a separate install step.
+
+    `cargo test` and `go test` resolve and fetch on their own; `pytest` and `vitest` use what an
+    install already put there. It decides whether a repository needs vendoring even when it declares
+    no `setup_command` — `clap` declares none and still cannot be scored offline, because `cargo`
+    goes to `index.crates.io` the moment the tests run.
+    """
+    offline_env: dict[str, str] = field(default_factory=dict)
+    """Environment that makes this toolchain resolve dependencies from the tree instead of a network.
+
+    Prefixed to the setup command a worker runs, because workers score with no network and the
+    dependencies are vendored into the start tree by then. Language knowledge rather than repository
+    knowledge: `pip` is told with `PIP_NO_INDEX` and `PIP_FIND_LINKS` whatever a repository's install
+    command happens to be, while WHICH command vendors them is the repository's to declare.
+
+    Go needs none — `go test` reads `vendor/` on its own, which is why Go worked before any of this
+    existed and why its absence here went unnoticed.
+    """
     scope_is_test_file: bool = False
     """Whether `{package}` means the test's own FILE rather than the directory holding it.
 
@@ -165,6 +197,12 @@ LANGUAGES: dict[str, Language] = {
         # `--nocapture` interleaves a test's own output between the name and its status, which no
         # line pattern can follow.
         filter_template="{name}",
+        resolves_dependencies_when_testing=True,
+        # The same login-shell trap Go hits: `sh -lc` sources /etc/profile, which resets PATH to the
+        # Debian default and drops `/usr/local/cargo/bin` — so `rustc` and `cargo` are "not found"
+        # in the very image that ships them, and a task fails for a reason that is not the task.
+        # Measured in `rust:1.94-bookworm`: `rustc: command not found`, scorer exit 127.
+        scorer_preamble='command -v cargo >/dev/null 2>&1 || export PATH="$PATH:/usr/local/cargo/bin:/usr/local/rustup/bin"',
         ran_a_test=r"^test (\S+::)?{name}( - should panic)? \.\.\. ok$",
         failed_a_test=r"^test (\S+::)?{name}( - should panic)? \.\.\. FAILED$",
         package_scoped=True,
@@ -177,6 +215,7 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r"func\s+((?:Test|Fuzz|Example)\w*)\s*\("),
         inline_tests=False,
         test_command="go test",
+        resolves_dependencies_when_testing=True,
         filter_template="-v -run ^{name}$ {package}",
         ran_a_test=r"--- PASS: {name}\b",
         failed_a_test=r"--- FAIL: {name}\b",
@@ -196,6 +235,7 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r"(?:void|Object)\s+(\w+)\s*\("),
         inline_tests=False,
         test_command="./gradlew test",
+        resolves_dependencies_when_testing=True,
         filter_template="--tests *{name}*",
         ran_a_test=r"BUILD SUCCESSFUL",
     ),
@@ -207,6 +247,7 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r"fun\s+`?([^`(]+?)`?\s*\("),
         inline_tests=False,
         test_command="./gradlew allTests",
+        resolves_dependencies_when_testing=True,
         filter_template="--tests *{name}*",
         ran_a_test=r"BUILD SUCCESSFUL",
     ),
@@ -224,6 +265,10 @@ LANGUAGES: dict[str, Language] = {
         # is what separates them: `::test_foo` does not match `::test_foobar`.
         filter_template="-v {package} -k {name}",
         scope_is_test_file=True,
+        # Verified in `python:3.12-bookworm` with `--network none`: with wheels vendored into the
+        # tree, `pip install -e .[dev] pytest` resolves from them and the suite runs. Without it the
+        # same command reaches for `setuptools` and the worker fails before an agent starts.
+        offline_env={"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": ".mo-eval-wheels"},
         ran_a_test=r"::{name}\b.*PASSED",
         # No failure wording, so the start state is read from the exit code. `pytest` reports a
         # unittest subtest failure on its own lines and still prints `::{name} PASSED` for the test
@@ -241,6 +286,7 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r"""(?:it|test)\s*\(\s*['"`]([^'"`]+)"""),
         inline_tests=False,
         test_command="npx jest",
+        vendoring_replaces_setup=True,
         # `-t` is a regular expression over a test's full name — its `describe` blocks joined to
         # its own by spaces — so the name is escaped and anchored for the same reason Ginkgo's is:
         # unanchored, a task about `renders a list` is also graded by `renders a list of two`, and
@@ -349,6 +395,7 @@ ALTERNATES: dict[str, tuple[Language, ...]] = {
             inline_tests=False,
             test_command="npx vitest run",
             command_marker="vitest",
+        vendoring_replaces_setup=True,
             # `--reporter=verbose` so Vitest prints one line per test, and the proof below names the
             # test rather than counting passes. A count cannot tell "three tests matched" from "one
             # test, three times": a Vitest config may declare several projects, and `hono` declares

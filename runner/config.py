@@ -28,7 +28,12 @@ from languages import LANGUAGES
 
 CONFIG_PATH = Path(".mo-eval") / "config.toml"
 
-_KNOWN_KEYS = {"language", "setup_command", "test_command", "forward_env", "env", "repo", "worker_image"}
+_MAX_OFFLINE_ARTIFACTS = 16
+"""How many paths a vendoring may name. One or two is the real shape; the bound is on the subprocess
+count that follows, since each named path becomes its own `git add -f`."""
+
+_KNOWN_KEYS = {"language", "setup_command", "test_command", "forward_env", "env", "repo", "worker_image",
+               "offline_prepare", "offline_artifacts"}
 
 
 class ConfigError(ValueError):
@@ -54,6 +59,21 @@ class RunnerConfig:
     worker_image: str | None = None
     """An OCI image pinned by digest that can build and test this repository — what a containerized
     agent run executes in. Optional: without it, tasks are emitted for host-native t-suite only."""
+    offline_prepare: str | None = None
+    """A command that puts this repository's dependencies INTO the tree, run before a task is frozen.
+
+    Workers score with no network, so whatever the tests import has to already be there. Declared by
+    the repository rather than derived from the language, because only the repository knows how its
+    dependencies install: `setup_command` here is `pip install -e .[dev] pytest`, and the vendoring
+    that satisfies it is `pip wheel --wheel-dir .mo-eval-wheels .[dev] pytest` — a repository using
+    Poetry, uv or a lockfile needs a different one entirely. Falls back to the language's own when
+    absent, which is how Go repositories get `go mod vendor` without declaring anything."""
+    offline_artifacts: tuple[str, ...] = ()
+    """What `offline_prepare` leaves behind, force-tracked into the start commit.
+
+    A repository's `.gitignore` ignores exactly these — `vendor/`, `node_modules/`, a wheel
+    directory — and the snapshotter freezes tracked files only, so without naming them the
+    preparation runs and its output never reaches a worker."""
 
 
 def load_config(path: Path) -> RunnerConfig:
@@ -98,6 +118,23 @@ def load_config(path: Path) -> RunnerConfig:
     setup = raw.get("setup_command")
     if setup is not None and (not isinstance(setup, str) or not setup.strip()):
         raise ConfigError(f"{path}: `setup_command`, when set, must be a non-empty string")
+    prepare = raw.get("offline_prepare")
+    if prepare is not None and (not isinstance(prepare, str) or not prepare.strip()):
+        raise ConfigError(f"{path}: `offline_prepare`, when set, must be a non-empty string")
+    artifacts = raw.get("offline_artifacts", [])
+    if not isinstance(artifacts, list) or any(not isinstance(a, str) or not a.strip() for a in artifacts):
+        raise ConfigError(f"{path}: `offline_artifacts` must be a list of non-empty strings")
+    if len(artifacts) > _MAX_OFFLINE_ARTIFACTS:
+        # Each becomes its own `git add -f`, so a list is a subprocess count. A vendoring leaves one
+        # or two directories behind — `vendor` and `.cargo`, `node_modules`, a wheel directory — and
+        # a repository naming hundreds is describing something other than what it vendored.
+        raise ConfigError(f"{path}: at most {_MAX_OFFLINE_ARTIFACTS} `offline_artifacts` may be named, "
+                          f"got {len(artifacts)}")
+    if prepare and not artifacts:
+        # A preparation whose output is not named is a preparation that runs and reaches nobody: the
+        # snapshotter freezes tracked files, and what this produces is exactly what a `.gitignore`
+        # ignores. Refused rather than run, because the failure is otherwise a worker error much later.
+        raise ConfigError(f"{path}: `offline_prepare` needs `offline_artifacts` naming what it leaves behind")
 
     return RunnerConfig(
         language=raw["language"],
@@ -107,6 +144,8 @@ def load_config(path: Path) -> RunnerConfig:
         env={str(key): value for key, value in env.items()},
         repo=raw.get("repo"),
         worker_image=image,
+        offline_prepare=prepare.strip() if isinstance(prepare, str) else None,
+        offline_artifacts=tuple(a.strip() for a in artifacts),
     )
 
 

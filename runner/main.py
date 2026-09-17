@@ -21,14 +21,14 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from languages import LANGUAGES, Language, detect_framework, resolve_contract  # noqa: E402
 from runner.client import ServiceError, client_for  # noqa: E402
 from runner.collect import bounded_text, change_source, repo_facts, tracked_files  # noqa: E402
-from runner.config import CONFIG_PATH, ConfigError, load_config, probe_environment  # noqa: E402
+from runner.config import CONFIG_PATH, ConfigError, RunnerConfig, load_config, probe_environment  # noqa: E402
 from runner.execute import (OrderError, Runner, _bounded_output, _end_group,  # noqa: E402
                             _export_into, _without_the_runners_credentials, commit_or_refuse)
 from wire import (ConventionSources, RepoFacts, ReviewComment, RunRequest, TaskPackage, UploadRequest,  # noqa: E402
@@ -152,7 +152,8 @@ def _bounded(argv: list[str], *, cwd: Path, timeout: float = _GIT_SECONDS,
         raise OrderError(f"{named} failed: {tail[-400:]!r}")
 
 
-def write_local_suite(package: TaskPackage, repo: Path, into: Path) -> Path | None:
+def write_local_suite(package: TaskPackage, repo: Path, into: Path,
+                      config: RunnerConfig | None = None) -> Path | None:
     """Materialize `into/<task_id>/` as a one-task local-test-suite over the task's start tree.
 
     The start tree is rebuilt the way the validation order built it — the parent commit exported,
@@ -163,6 +164,7 @@ def write_local_suite(package: TaskPackage, repo: Path, into: Path) -> Path | No
     if not package.local_suite:
         return None
     meta = json.loads(package.files["meta.json"])
+    _refuse_a_bundle_no_worker_could_score(meta, config)
     root = _safe_relative(package.task_id, into)
     if root.exists():
         shutil.rmtree(root)
@@ -177,19 +179,114 @@ def write_local_suite(package: TaskPackage, repo: Path, into: Path) -> Path | No
     _write_without_following(root / ".mo-eval-scaffold.patch", package.files["scaffold.patch"])
     _bounded(["git", "apply", "--whitespace=nowarn", ".mo-eval-scaffold.patch"], cwd=root, timeout=_APPLY_SECONDS)
     (root / ".mo-eval-scaffold.patch").unlink()
-    _prepare_offline(root, meta)
+    _prepare_offline(root, meta, config=config)
     _write_all(package.local_suite, root, "local suite")
     _bounded(git + ["add", "-A"], cwd=root)
-    for artifact in _offline_artifacts(meta):
-        if (root / artifact).exists():
-            # Forced past .gitignore: the frozen snapshot takes tracked files, and an ignored
-            # vendor/ would vanish between this tree and the worker that scores it.
-            _bounded(git + ["add", "-f", artifact], cwd=root)
+    for artifact in _offline_artifacts(meta, config):
+        _require_within(root, artifact)
+        if not (root / artifact).exists():
+            # Declared and absent means the preparation did not produce what it promised — a typo, a
+            # different path, a partial failure. Skipping it silently freezes a tree WITHOUT the
+            # dependencies and ships a bundle that fails in a worker, which is the whole failure this
+            # declaration exists to prevent. The exception is a language default, which describes a
+            # typical repository rather than this one: `go mod vendor` writes no `vendor/` for a
+            # module with no dependencies, and that tree is complete as it stands.
+            if config is not None and config.offline_prepare:
+                raise OrderError(
+                    f"`offline_prepare` did not produce the declared artifact {artifact!r}; the task's "
+                    f"tree would be frozen without the dependencies a worker cannot fetch"
+                )
+            continue
+        # Forced past .gitignore: the frozen snapshot takes tracked files, and an ignored
+        # vendor/ would vanish between this tree and the worker that scores it.
+        _bounded(git + ["add", "-f", artifact], cwd=root)
     _bounded(git + ["commit", "-q", "--no-verify", "-m", f"mo-eval start state for {package.task_id}"], cwd=root)
     return root
 
 
-def _prepare_offline(root: Path, meta: dict, run=None) -> None:
+_OFFLINE_PREPARE_MAX_PIDS = 2048
+"""How many processes a preparation may have at once.
+
+No memory or CPU ceiling sits beside it, deliberately: a Rust or TypeScript vendoring legitimately
+uses several gigabytes, so a cap low enough to bound a hostile one would refuse real work, and a cap
+high enough for real work bounds nothing on a CI runner that has less than the cap. The process table
+is different — the gap between what a vendoring needs and what an attack needs is three orders of
+magnitude, so there is a number that separates them.
+"""
+
+
+def _resolved_offline_prepare(meta: dict, config: RunnerConfig | None) -> str | None:
+    """The preparation that will actually run: the repository's own, else the language's default.
+
+    One resolution, because two callers ask this — the gate that refuses an unscorable bundle, and
+    the step that runs it — and two spellings of the same question drift. The drift direction is the
+    dangerous one: a gate that sees LESS than the preparation passes a bundle the preparation then
+    does nothing for.
+    """
+    declared = config.offline_prepare if config is not None else None
+    if declared:
+        return declared
+    contract = _contract_for(meta)
+    return contract.offline_prepare if contract is not None else None
+
+
+def _require_within(root: Path, artifact: str) -> None:
+    """Refuse an artifact path that names anything outside the task's own tree.
+
+    A repository declares these, and they are handed to `git add -f` in a directory this runner
+    created. An absolute path or one climbing out of the tree would be asking the runner to reach
+    somewhere it has no business reaching — refused for the same reason an order id is checked
+    before a directory is made from it.
+
+    Raises:
+        OrderError: If the path is absolute, climbs out, or is empty.
+    """
+    if not artifact or artifact.startswith(("/", "~")) or PurePosixPath(artifact).is_absolute():
+        raise OrderError(f"offline artifact {artifact!r} must be a path inside the repository")
+    if any(segment == ".." for segment in PurePosixPath(artifact).parts):
+        raise OrderError(f"offline artifact {artifact!r} climbs out of the repository")
+
+
+def _refuse_a_bundle_no_worker_could_score(meta: dict, config: RunnerConfig | None) -> None:
+    """Refuse to write a bundle whose dependencies nothing puts into its tree.
+
+    A worker scores with no network. A repository that declares a `setup_command` is saying its tests
+    need something installed, and unless something vendors that into the start tree the bundle mines,
+    validates, packages and uploads correctly and then fails in the worker before an agent starts —
+    `No matching distribution found`, reported as `launch_error` after a lane has claimed the job and
+    pulled an image.
+
+    Refused here, at the step that produces the bundle, because whether the dependencies are present
+    is a property of the bundle rather than of the lane that later consumes it. Loud and early beats
+    correct-looking and unrunnable.
+
+    Raises:
+        OrderError: If the repository needs dependencies and nothing declares how to vendor them.
+    """
+    contract = _contract_for(meta)
+    fetches_when_testing = contract is not None and contract.resolves_dependencies_when_testing
+    # A contract whose vendoring REPLACES the install needs the installed tree present whether or not
+    # the repository named a setup command: `bunx vitest` cannot run without `node_modules`, and such
+    # a repository declaring nothing would otherwise ship with neither a setup line nor the tree.
+    needs_an_installed_tree = contract is not None and contract.vendoring_replaces_setup
+    if config is None or not (config.setup_command or fetches_when_testing or needs_an_installed_tree):
+        # Nothing to install and a toolchain that fetches nothing when the tests run, so there is
+        # nothing to vendor. A suite whose tests import only what the image already has scores
+        # offline today, which is how a synthetic one-file suite passes.
+        return
+    if _resolved_offline_prepare(meta, config):
+        return
+    why = ("its tests resolve dependencies as they run" if fetches_when_testing
+           else "its test runner needs an installed dependency tree" if needs_an_installed_tree
+           else "it declares a `setup_command`")
+    raise OrderError(
+        f"{why}, and nothing puts those dependencies into the task's tree — a worker scores with no "
+        f"network. Declare `offline_prepare` and `offline_artifacts` in {CONFIG_PATH}, or the bundle "
+        f"cannot be scored"
+    )
+
+
+def _prepare_offline(root: Path, meta: dict, run=None, config: RunnerConfig | None = None) -> None:
     """Make the start tree scorable with no network, the way its language does that.
 
     mo-eval's baseline and scorer workers have no network at all — the first live run failed on
@@ -211,9 +308,60 @@ def _prepare_offline(root: Path, meta: dict, run=None) -> None:
     """
     run = run or _bounded
     contract = _contract_for(meta)
-    if contract is None or not contract.offline_prepare:
+    # The repository's own, when it declared one: only it knows how its dependencies install, and
+    # the language's default is a default rather than an answer. Go needs nothing declared because
+    # `go mod vendor` IS the answer for every Go repository; `pip install -e .[dev] pytest` is not.
+    prepare = _resolved_offline_prepare(meta, config)
+    if not prepare:
         return
-    run(shlex.split(contract.offline_prepare), cwd=root, timeout=_OFFLINE_PREPARE_SECONDS,
+    image = config.worker_image if config is not None else None
+    if image and shutil.which("docker") is None:
+        # Refused rather than prepared here instead. Falling back to this host would vendor for THIS
+        # platform and interpreter, which is the failure the image exists to avoid — and it would do
+        # it silently, leaving a bundle that looks complete and cannot be scored.
+        raise OrderError(
+            "this repository declares a worker image and an offline preparation, but there is no "
+            "`docker` on this runner to prepare in it. Preparing on the runner instead would vendor "
+            "for the runner's own platform, which the worker cannot use"
+        )
+    if image:
+        # IN the worker image, not on this host. A vendored dependency is often a binary built for
+        # one platform and one interpreter: preparing `sqlglot` on macOS produced
+        # `duckdb-1.5.5-cp313-cp313-macosx_11_0_arm64.whl`, which a linux/amd64 worker running
+        # Python 3.12 cannot use — and the preparation SUCCEEDS, so the bundle looks complete and
+        # fails offline much later. Prepared where it will be consumed, it is right by construction.
+        #
+        # With a network, unlike scoring: this is the step whose whole job is fetching what scoring
+        # will not be able to.
+        # Named, so it can be stopped by name. Ending the deadline kills the `docker` CLI and the
+        # process group it sits in, which is enough for every other command this runner runs — but a
+        # container is a child of the daemon, not of the CLI. Kill the CLI alone and the container
+        # keeps running, and `--rm` never fires because it removes a container only once it exits.
+        container = f"mo-eval-prepare-{os.getpid()}-{root.name}"
+        try:
+            run(["docker", "run", "--rm", "--name", container,
+                 # A deadline bounds how LONG a preparation runs, not how fast it consumes. A fork
+                 # bomb exhausts the host's process table long before the deadline fires, and killing
+                 # the container afterwards cannot give back what was already taken. Far above any
+                 # real vendoring — `pip wheel`, `cargo vendor` and `bun install` spawn tens of
+                 # processes, not thousands — so it costs a legitimate repository nothing.
+                 "--pids-limit", str(_OFFLINE_PREPARE_MAX_PIDS),
+                 "--user", f"{os.getuid()}:{os.getgid()}",
+                 "-v", f"{root}:/mo-eval-tree", "-w", "/mo-eval-tree", "--entrypoint", "sh",
+                 image, "-c", prepare],
+                cwd=root, timeout=_OFFLINE_PREPARE_SECONDS,
+                env=_without_the_runners_credentials(os.environ, {}))
+        except Exception:
+            # Best effort and deliberately silent: the failure being reported is the preparation's,
+            # and a cleanup that raises would replace it with one about cleaning up.
+            subprocess.run(["docker", "kill", container], capture_output=True, timeout=_GIT_SECONDS,
+                           check=False)
+            raise
+        return
+    # Through a shell, the same as the in-image path above: vendoring is often a pipeline —
+    # `cargo vendor >> .cargo/config.toml` writes the configuration that makes the vendor directory
+    # take effect — and a declared command must mean one thing wherever it runs.
+    run(["sh", "-c", prepare], cwd=root, timeout=_OFFLINE_PREPARE_SECONDS,
         env=_without_the_runners_credentials(os.environ, {}))
 
 
@@ -226,8 +374,12 @@ def _contract_for(meta: dict) -> Language | None:
         return None
 
 
-def _offline_artifacts(meta: dict) -> tuple[str, ...]:
-    """What the language's offline preparation leaves behind that must be tracked."""
+def _offline_artifacts(meta: dict, config: RunnerConfig | None = None) -> tuple[str, ...]:
+    """What the offline preparation leaves behind that must be tracked — the repository's own when
+    it declared a preparation, the language's otherwise. Read from whichever declared the command,
+    because artifacts that do not belong to the command that ran are artifacts that do not exist."""
+    if config is not None and config.offline_prepare:
+        return config.offline_artifacts
     contract = _contract_for(meta)
     return contract.offline_artifacts if contract is not None else ()
 
@@ -398,7 +550,7 @@ def suite(arguments: argparse.Namespace) -> int:
         if verdict.task is not None:
             written.append(write_package(verdict.task, out / "tasks"))
             try:
-                bundle = write_local_suite(verdict.task, repo, out / "local-suite")
+                bundle = write_local_suite(verdict.task, repo, out / "local-suite", config)
             except (OrderError, ValueError, OSError) as failure:
                 # The task itself is already written and still valid. Only its containerized
                 # bundle could not be built, and one task's bundle failing is not the suite's end.
