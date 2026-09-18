@@ -22,7 +22,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
-from languages import Language
+from languages import Language, is_source_path
 from wire import PROTOCOL, ChangeFacts, ChangeSource, FileFacts, FileSource, RepoFacts
 
 _NUMSTAT = re.compile(r"^(\d+|-)\t(\d+|-)\t(.+)$")
@@ -553,13 +553,24 @@ def _prose(repo: Path, change_id: str) -> dict[str, str]:
     return prose
 
 
-def change_source(repo: Path, facts: RepoFacts, change_ids: list[str]) -> list[ChangeSource]:
-    """Send both sides of every file the named changes touched, plus their human prose.
+def change_source(repo: Path, facts: RepoFacts, change_ids: list[str], language: Language) -> list[ChangeSource]:
+    """Send both sides of every file the named changes touched that the splitter will look at, plus
+    their human prose.
+
+    The splitter keeps source and test files and discards the rest, so sending the rest puts a
+    repository's documentation, configuration and fixtures on the wire for a service that reads none
+    of it. Measured on `gofiber/fiber`: 858,300 of 7,058,454 bytes, almost all of it three large
+    Markdown files under `docs/`. `is_source_path` is the same predicate the splitter applies, so
+    what is withheld here is exactly what would have been dropped there.
+
+    A file's blob is never read when it is not sent, so the saving is in `git cat-file` too, not only
+    in egress.
 
     Args:
         repo: Local checkout.
         facts: Phase-1 facts, for the path list of each change.
         change_ids: Exactly the changes the service selected.
+        language: The resolved contract, which decides what counts as source.
 
     Returns:
         One record per requested change, in the order requested.
@@ -575,6 +586,7 @@ def change_source(repo: Path, facts: RepoFacts, change_ids: list[str]) -> list[C
                 child_content=_blob(repo, change_id, file.path),
             )
             for file in change.files
+            if is_source_path(file.path, language)
         ]
         sources.append(ChangeSource(change_id=change_id, files=files, prose=_prose(repo, change_id)))
     return sources

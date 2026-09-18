@@ -38,6 +38,11 @@ inputs:
       Where the generated suite is written. Defaults to a directory under the runner's temp space,
       so nothing is written into the repository's checkout.
     default: ""
+  dry-run:
+    description: >-
+      "true" mines and selects, prints the funnel, and runs nothing — seconds instead of minutes,
+      for a first look at whether a repository is a fit before any candidate is validated.
+    default: "false"
 
 runs:
   using: composite
@@ -55,6 +60,7 @@ runs:
           --service "${{ inputs.service }}" \
           --history "${{ inputs.history }}" --candidates "${{ inputs.candidates }}" \
           --out "${{ inputs.out || format('{0}/mo-eval', runner.temp) }}" \
+          ${{ inputs.dry-run == 'true' && '--dry-run' || '' }} \
           ${{ inputs.arms != 'none' && format('--run {0}', inputs.arms) || '' }}
       env:
         MO_EVAL_TOKEN: ${{ inputs.token }}
@@ -63,6 +69,8 @@ runs:
     - name: what crossed the boundary, and what survived
       if: always()
       shell: bash
+      env:
+        MO_EVAL_DRY_RUN: ${{ inputs.dry-run }}
       run: |
         out="$MO_EVAL_OUT"
         echo '## mo-eval suite' >> "$GITHUB_STEP_SUMMARY"
@@ -76,7 +84,22 @@ runs:
           python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(f\"- **{m['title']}** — {len(m['generated']['test_names'])} test(s), validated={m['generated']['validated']}\")" "$meta" >> "$GITHUB_STEP_SUMMARY"
           count=$((count + 1))
         done
-        [ "$count" -gt 0 ] || echo '_no task survived validation — see the funnel in the job log_' >> "$GITHUB_STEP_SUMMARY"
+        # The runner has already appended the funnel, the first failure of each kind, and what the
+        # dominant reason usually means; this line only says that the task list above is empty. A
+        # dry run validates nothing by design, so an empty list is not a suite that yielded nothing.
+        # And a runner that stopped short — a config error, a service that refused a request —
+        # reported no funnel, so neither sentence applies. Read from the runner's own record:
+        # `GITHUB_STEP_SUMMARY` is a different file for every step, so what the runner appended
+        # to its own is not in this one.
+        if [ "$count" -eq 0 ]; then
+          if [ ! -s "$out/funnel.txt" ]; then
+            echo '_the runner stopped before it could report a funnel; the job log says why_' >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$MO_EVAL_DRY_RUN" = "true" ]; then
+            echo '_dry run: nothing was validated; the funnel above is the fit check_' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '_no task survived; the funnel above says which stage emptied it_' >> "$GITHUB_STEP_SUMMARY"
+          fi
+        fi
 
     - uses: actions/upload-artifact@v4
       if: always()
@@ -87,4 +110,5 @@ runs:
         path: |
           ${{ env.MO_EVAL_OUT }}/tasks
           ${{ env.MO_EVAL_OUT }}/wire
+          ${{ env.MO_EVAL_OUT }}/funnel.txt
         retention-days: 30

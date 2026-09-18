@@ -388,7 +388,11 @@ class RunRequest:
     harness named below."""
     repeats: int = 1
     harnesses: list[str] | None = None
-    """Client harnesses to compare: `mo`, `cc`, or both — the service refuses a name it cannot run.
+    """Client harnesses to compare — `mo`, `cc`, `pi` — and the service refuses a name it cannot run.
+
+    The accepted set lives in `service/app.py` and again in `lane/dispatch.py`, held equal by a test,
+    because both must agree before a job is claimed. Read `_HARNESSES` there rather than trusting
+    this line, which is a summary and has been stale before.
 
     `None` rather than a default of `["mo"]`, so a caller who names no harness sends no value to
     distinguish: `to_json` omits a `None` field, an omitted key and a null one decode alike, and the
@@ -432,12 +436,73 @@ class RunSummary:
     """Short-lived GET for the suite-level cells.json, present once the lane has written it."""
     suite_url: str | None
     rubric_url: str | None
+    actor: str | None = None
+    """The GitHub login that started the run, as its ID token named it.
+
+    `None` — and omitted from the encoded response entirely — when nobody is named: a run the
+    service's own bearer submitted, and every run recorded before the claim was captured. Absent and
+    empty must stay distinguishable, so a reader never renders a blank login as a real one."""
+    actor_id: str | None = None
+    """`actor`'s numeric id, `None` on the same terms. An audit and match key that survives a rename,
+    where the login does not."""
+
+    submitted_at: str | None = None
+    """When the run was recorded, as `YYYYmmddTHHMMSSZ` — the stamp already in its storage key rather
+    than a second clock. `None` only for a record written before keys were stamped."""
+
+    started_at: str | None = None
+    """When a lane claimed the job (`claimed_at`), ISO-8601. `None` while it is still queued, and on
+    a run that predates the lane stamping it — so absent means "not known", never "just now"."""
+
+    planned_cells: int = 0
+    """How many cells this run intends: tasks x arms x repeats. The size of the wait, which is what
+    makes elapsed time mean something. `0` only if the record names no tasks."""
 
 
 @dataclass(frozen=True)
 class ResultsResponse:
     repo: str
     runs: list[RunSummary]
+
+
+@dataclass(frozen=True)
+class RepositorySummary:
+    """One repository a viewer may open."""
+
+    repo: str
+    """`owner/name`, spelled exactly as the run recorded it — `results` hashes this string through
+    `_safe`, so a normalised spelling here would resolve to a different prefix and list no runs."""
+
+
+@dataclass(frozen=True)
+class RepositoriesResponse:
+    """The repositories of the owners that were asked for. Deliberately carries no run count: counting
+    means reading the runs, which is the cross-tenant listing this index exists to avoid."""
+
+    repositories: list[RepositorySummary]
+
+    unserved_owners: list[str] = field(default_factory=list)
+    """Owners of this viewer's that the deployment refuses — denied, or unknown on a closed one.
+
+    Computed only when `repositories` is empty, because that is the only screen that asks: an empty
+    chooser has to tell a customer who has not run anything yet from one who never will, and the
+    second will never see a repository however well they configure one. Empty in every other case,
+    including when the answer is not known — a throttled owners table is not evidence that somebody
+    is refused."""
+
+    truncated: bool = False
+    """Whether something was left out — too many owners to scan, or too many repositories to return.
+
+    The bounds exist because this route's cost is set by the CALLER (one listing per owner on the
+    token) rather than by their data, so it has to be able to stop. Saying so is the point: a chooser
+    that silently drops entries reads as `you have no others`, which is a claim about the viewer's
+    account that the service did not check. False also when nothing was asked for.
+
+    Always emitted, including when false — unlike the fields that ship to the published Action, which
+    are omitted when absent so an older runner never sees a key it cannot read. This one ships only to
+    the SPA in `evals-ui`, which is deployed from this same tree, so the two halves move together and
+    a present-but-false field costs nothing. The browser still defaults it, for the version pairing
+    that outlives a deploy."""
 
 
 # --- phase 7: sharing a run as a link -------------------------------------------------------------
@@ -480,7 +545,58 @@ memory.
 """
 
 
-PROTOCOL = 2
+SCORER_IN_TREE = ".mo-eval/acceptance/acceptance.sh"
+"""Where a packaged task's generated scorer sits inside its own start tree.
+
+A service/runner contract value rather than either side's detail: the service writes the scorer
+there and names it in the manifest's `test:` line, and the runner runs that same path when it scores
+the task in its own image before shipping it (#4022). Spelled once so a move cannot leave the check
+running a file that is no longer there — which would read as a task nobody can grade.
+"""
+
+MAX_EVENT_BYTES = 6 * 1024 * 1024
+"""How large one request to the hosted service may be, counted the way the platform counts it.
+
+A Lambda Function URL refuses a synchronous invocation past this before the function is reached, and
+what it measures is the invocation EVENT, which carries the request body as a JSON string. So a
+request is compared against this with `event_cost`, not by its own length: the two differ by the
+content rather than by a constant.
+
+Measured against the deployed service rather than read off a document: a body of plain text got
+6,281,508 bytes through and was refused above that, while one dense in quotes and newlines was
+refused from 3,586,311 — 1.75x apart as bodies, and both within 16 KB of this figure once escaped.
+
+A service/runner contract value: the runner packs its requests against it, and the service reads it
+as a bound on a raw body too, since the event that carries one is never smaller than it is.
+"""
+
+EVENT_OVERHEAD_BYTES = 64 * 1024
+"""How much of `MAX_EVENT_BYTES` is left for the rest of the invocation event.
+
+The body is most of an event but not all of it: the request context, the headers and a GitHub
+Actions ID token in the bearer travel in the same budget. Measured at under 10 KB against the
+deployed service, and left generous because undershooting costs one more request while overshooting
+costs the whole suite.
+"""
+
+
+def event_cost(text: str) -> int:
+    """How many bytes `text` costs inside the invocation event that carries it.
+
+    The event carries the body as a JSON string, so every quote, backslash and control character
+    already in it is escaped a second time.
+
+    Additive over concatenation: escaping is per character and a split never lands inside one, so the
+    cost of two fragments joined is the sum of their costs. That is what lets a request be packed
+    one candidate at a time instead of re-encoding the whole body per candidate.
+
+    In characters, which here is in bytes: `json.dumps` escapes non-ASCII too, so nothing it
+    produced encodes to more than one.
+    """
+    return len(json.dumps(text)) - 2
+
+
+PROTOCOL = 4
 """The revision of this protocol the copy of these types in THIS tree speaks.
 
 Sent by the runner as `RepoFacts.protocol` so the service knows which fields it may put in an order.
@@ -492,6 +608,14 @@ is the number that shipped with it.
    a probe's output rather than the tail that comes back.
 2. `Step.counterproof` and `StepResult.counterproof_seen`: the same for a test that ran and FAILED,
    which is what a start state has to do to earn a task.
+3. `RunSummary.actor` and `RunSummary.actor_id`: who started a run, in the `/v1/results` response.
+   Declared rather than fixed — the number buys nothing here, because a runner never asks for that
+   response. The Action vendors this whole file, so its surface moved even though nothing it decodes
+   did, and the gate compares the surface rather than guessing at use.
+4. `RepositorySummary` and `RepositoriesResponse`: the chooser's read, so a signed-in viewer can be
+   shown which repositories they may open rather than having to name one. Declared for the same
+   reason as 3 and with the same caveat — these cross between the BFF and a browser, so a runner
+   neither sends nor receives them and there is nothing to withhold from an older one.
 """
 
 MAX_DECODED_ENTRIES = 1_000_000

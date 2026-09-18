@@ -16,6 +16,7 @@ out of the path, and `split.py` already has that branch.
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass, field
 
 
@@ -121,6 +122,23 @@ class Language:
     no `setup_command` — `clap` declares none and still cannot be scored offline, because `cargo`
     goes to `index.crates.io` the moment the tests run.
     """
+    offline_test_args: tuple[str, ...] = ()
+    """Arguments that make the TEST command resolve from the vendored tree instead of a network.
+
+    The mirror image of `offline_env`, and needed for the same reason by a different shape of
+    toolchain: `offline_env` is prefixed to the SETUP command, which a language resolving its
+    dependencies at install time always has. A language that resolves them as the tests run may
+    declare no setup command at all — `clap` declares none — so there is nothing to prefix, and the
+    telling has to ride on the command that does run.
+
+    Cargo is the case, and arguments are what make it deliverable. The same setting exists in
+    `.cargo/config.toml`, but a repository that already pins `[source.crates-io]` (a mirror, its own
+    offline CI) cannot have a second one appended: the duplicate key is reported as a *manifest*
+    error naming `Cargo.toml`, a file that is not at fault. It exists in the environment too, and a
+    worker's manifest has nowhere to carry environment. An argument has neither problem, and takes
+    precedence over the file when both are present — measured on a repository pinning an unreachable
+    mirror, where the argument form runs the tests and the appended stanza fails to parse.
+    """
     offline_env: dict[str, str] = field(default_factory=dict)
     """Environment that makes this toolchain resolve dependencies from the tree instead of a network.
 
@@ -149,10 +167,121 @@ class Language:
     write tests the same way and differ only in what runs them: Jest and Vitest are both `it(` and
     `test(`, and a repository says which it uses by declaring `npx vitest run`. A contract naming a
     marker is chosen only when the marker is in that command, and never by counting."""
+    runner_reported: str = ""
+    """Regex proving the test RUNNER executed and reported, whatever any test's outcome was.
+
+    Weaker than `failed_a_test` and available where that is not. The question the scorer needs
+    answered on a non-zero exit is whether anything ran at all, and a by-name failure is one way to
+    know — but only two contracts can print one. A runner's own summary line answers the same
+    question without naming a test, so a contract with no failure wording can still tell a broken
+    environment from a failed task.
+
+    No `{name}`: this is about the runner, not about one test. A toolchain that compiled the
+    repository's own code and refused it has reported — Go's `[build failed]`, cargo's `could not
+    compile` — which is what lets the scorer grade a tree the agent left uncompilable as a failed
+    task rather than an environment that could not run the test.
+
+    Measured, not guessed, because these encode what a tool PRINTS. Vitest reports
+    `Test Files  1 failed (1)` for a file whose import could not be resolved — nothing ran, and a
+    pattern over that line would have claimed it did; its `Tests` line reads `no tests` in the same
+    output, which is why that is the one named here. pytest prints `1 error in 0.07s` for a
+    collection failure and `1 failed, 1 passed in 0.01s` when tests ran, and both a failing test and
+    an absent pytest exit 1 — the exit code cannot separate them at all.
+
+    Empty for a contract whose summary wording has not been measured; those keep grading on the exit
+    code, as they always did."""
+    build_failed_at: str = ""
+    """Regex whose first group captures the repository path of a file the compiler refused, relative
+    to where the test command ran. Read by the judge over the whole of a probe's tail under
+    `MULTILINE`, so a diagnostic that spans lines can be anchored to its header; a newline in it is
+    written as `\\n`, never reached through `\\s`, which would cross into the line before.
+
+    A test that names what the change adds cannot run until the change exists, and in a compiled
+    language that is a compile error rather than a failure by name. The path says whose failure it
+    is. A file the scaffold wrote names the task; a source file, a dependency or a manifest names a
+    tree that does not build for a reason no agent is asked to fix.
+
+    Only the path, not the reason. Go's wording for a missing symbol and for a missing module has
+    the same `file:line:col:` shape; `build_failed_summary` separates them, because only the first
+    ends in `[build failed]`.
+
+    Empty where compile errors have not been measured, and for an interpreted language, where the
+    question does not arise: the test runs and fails by name. Declared together with
+    `build_failed_summary`, never alone.
+    """
+    build_failed_summary: str = ""
+    """Regex for the line the toolchain prints when it compiled the repository's own code and
+    refused it. A line pattern, read by the judge line by line.
+
+    The other half of `build_failed_at`. Go's wording for a missing symbol and for a missing module
+    has the same `file:line:col:` shape, and only the summary tells them apart: `FAIL pkg [build
+    failed]` is a compiler refusing this code, `FAIL pkg [setup failed]` is a module it could not
+    fetch or a file it could not parse. `runner_reported` cannot stand in for it, because a
+    repository declaring `go test ./...` prints `ok` for the packages that did build on the same
+    run, and that says the toolchain ran, not that it compiled and refused the file at hand.
+    """
     scorer_preamble: str = ""
     """Shell lines the generated scorer runs first — environment the language's toolchain needs that a
     scoring shell may not provide. Kept per language rather than per repository: it is a fact about
     the toolchain, not the code under test."""
+
+
+def is_source_path(path: str, language: "Language") -> bool:
+    """Whether a changed file is one the splitter will look at.
+
+    The runner asks this before it reads a blob, and the service asks it again before it diffs one.
+    Spelled once because those two answers must be the same: a runner that sent less than the
+    service keeps would withhold part of a change from its own split, and one that sent more would
+    ship a customer's files to a service that discards them unread.
+
+    Path and contract only — no content — so the runner can apply it to the facts it already holds.
+    """
+    return path.endswith(language.source_suffixes) or bool(language.test_path.search(path))
+
+
+def offline_test(test_command: str, language: "Language") -> str:
+    """A test command as a worker must run it: told to resolve from the tree, not from a network.
+
+    The same contract-supplied telling `offline_setup` gives a setup command, for a toolchain that
+    resolves when the tests run. Appended rather than prefixed because what it supplies is arguments,
+    and the repository's own command is not rewritten — only extended.
+
+    Lives here beside `offline_setup` because three renderings of one bundle need the same string —
+    the scorer, the acceptance lines a prompt quotes, and the whole-suite command the conventions
+    judge runs — and a bundle whose scorer resolves offline while its prompt's commands do not is a
+    task an agent cannot work on.
+
+    Empty for a contract that needs no telling, which is every one but Rust today.
+    """
+    if not language.offline_test_args:
+        return test_command
+    return " ".join([test_command, *(shlex.quote(argument) for argument in language.offline_test_args)])
+
+
+def offline_setup(setup_command: str, language: "Language") -> str:
+    """A setup command as a worker must run it: told to resolve from the tree, not from a network.
+
+    A worker scores with `--network none` and the dependencies were vendored into the start tree
+    before it was frozen, so the install has to be pointed at them. Which variables do that is a
+    fact about the toolchain, so it comes from the contract; the command itself is the repository's
+    and is not rewritten — only prefixed, so what runs is still what the repository declared.
+
+    Lives here rather than beside the manifest it is written into, because two callers need the same
+    string: the service, rendering a bundle's `setup:` line, and the runner, running that bundle's
+    scorer in its own image before shipping it. A second spelling would let the check pass under an
+    environment the worker will not have.
+
+    Empty for a contract that needs no telling. `go test` reads `vendor/` by itself, which is why Go
+    scored offline long before any of this was written.
+    """
+    if not language.offline_env:
+        return setup_command
+    # `export …;` rather than a `VAR=x command` prefix. A prefix binds to ONE command, and a setup
+    # command is not always one: `cd sub && pip install -e .` would apply the variables to `cd` and
+    # leave `pip` reaching for a network that is not there. A manifest's setup runs under `/bin/sh
+    # -lc`, so an export reaches every part of whatever the repository declared.
+    exported = " ".join(f"{name}={shlex.quote(value)}" for name, value in sorted(language.offline_env.items()))
+    return f"export {exported}; {setup_command}"
 
 
 def _pattern(source: str) -> re.Pattern[str]:
@@ -198,6 +327,37 @@ LANGUAGES: dict[str, Language] = {
         # line pattern can follow.
         filter_template="{name}",
         resolves_dependencies_when_testing=True,
+        # `cargo vendor` alone, and the stanza it prints written ONLY when the repository has no
+        # cargo config of its own. Appending to one that exists is what breaks: a repository already
+        # pinning `[source.crates-io]` gets a duplicate key, which cargo reports as a manifest error
+        # pointing at `Cargo.toml` — the wrong file, so the reader looks in the wrong place.
+        #
+        # Where the file is written, an agent's own `cargo test` resolves from the tree too, which a
+        # coding agent needs: it iterates by running the tests. Where it is not, `offline_test_args`
+        # still carries the scorer, the acceptance commands and the conventions judge, so the bundle
+        # grades correctly and only an ad-hoc invocation reaches for a network.
+        #
+        # `cargo vendor` ignores the repository's own source replacement, measured: it vendored from
+        # crates.io on a repository pinning an unreachable mirror, where `--respect-source-config`
+        # spent its retries on `Could not resolve host`.
+        #
+        # A crate with no dependencies is the case the missing-artifact exemption turns on, and this
+        # survives it: cargo writes no `vendor/`, and prints "There is no dependency to vendor in
+        # this project." to STDERR — so the config this redirects stdout into is left empty, which is
+        # valid TOML and leaves cargo working. Absence here means there was nothing to vendor, which
+        # is the condition that exemption requires.
+        offline_prepare=(
+            'if [ -e .cargo/config.toml ] || [ -e .cargo/config ]; then cargo vendor >/dev/null; '
+            'else mkdir -p .cargo && cargo vendor > .cargo/config.toml; fi'
+        ),
+        # `.cargo` as well as `vendor`, because the config written above is what makes the vendored
+        # directory findable, and a repository ignoring either would ship a tree that has the crates
+        # and cannot resolve them.
+        offline_artifacts=("vendor", ".cargo"),
+        offline_test_args=(
+            "--config", 'source.crates-io.replace-with="vendored-sources"',
+            "--config", 'source.vendored-sources.directory="vendor"',
+        ),
         # The same login-shell trap Go hits: `sh -lc` sources /etc/profile, which resets PATH to the
         # Debian default and drops `/usr/local/cargo/bin` — so `rustc` and `cargo` are "not found"
         # in the very image that ships them, and a task fails for a reason that is not the task.
@@ -205,6 +365,20 @@ LANGUAGES: dict[str, Language] = {
         scorer_preamble='command -v cargo >/dev/null 2>&1 || export PATH="$PATH:/usr/local/cargo/bin:/usr/local/rustup/bin"',
         ran_a_test=r"^test (\S+::)?{name}( - should panic)? \.\.\. ok$",
         failed_a_test=r"^test (\S+::)?{name}( - should panic)? \.\.\. FAILED$",
+        # Measured on a scratch crate. `test result: ok.` / `test result: FAILED.` once tests ran;
+        # `error: could not compile `crate` (lib test) due to 1 previous error` when the test
+        # target did not build, which for an additive change is the start state's own failure
+        # (#4224). `error: no matching package named` and `cargo: command not found` name the
+        # environment and match neither. What this cannot separate is a compiler that fails for the
+        # environment's sake — a missing linker also ends in `could not compile` — and #4022's
+        # packaging-time scorer run is the check for that.
+        runner_reported=r"^(test result: |error: could not compile )",
+        # `error[E0425]: …` then `--> tests/it.rs:1:52` for an integration test, `--> src/lib.rs:4:49`
+        # for an inline one. Anchored to the `error` header on the line before, because rustc puts
+        # the same `-->` under a warning, and a parent with an unused import warns on every run.
+        # `--> Cargo.toml:7:2` (a manifest error) is deliberately not a `.rs` file.
+        build_failed_at=r"^error(?:\[E[0-9]+\])?: [^\n]*\n[ \t]*--> ([^\n:]+\.rs):[0-9]+:[0-9]+",
+        build_failed_summary=r"^error: could not compile ",
         package_scoped=True,
     ),
     "go": Language(
@@ -219,6 +393,18 @@ LANGUAGES: dict[str, Language] = {
         filter_template="-v -run ^{name}$ {package}",
         ran_a_test=r"--- PASS: {name}\b",
         failed_a_test=r"--- FAIL: {name}\b",
+        # Measured on gin (go1.25 on Actions, go1.27 locally). `ok pkg 0.4s`, `ok pkg 0.4s [no tests
+        # to run]`, `FAIL pkg 0.4s` and `FAIL pkg [build failed]` all say `go test` ran on the
+        # repository's own code — the last is a test binary it compiled and refused, which for an
+        # additive change is the start state doing exactly what it should (#4224). `FAIL pkg
+        # [setup failed]` is a module it could not resolve or a file it could not parse, and is left
+        # out on purpose: that is the environment, not the task.
+        runner_reported=r"^(ok|FAIL)\s+\S+\s+([0-9.]+s|\[build failed\])",
+        # `./x_test.go:4:37: undefined: f` at the root; `sub/x_test.go:3:35: …` in a nested package,
+        # relative to where `go test` ran.
+        # A path begins in column one: `go test -v` indents what a test itself logs by four spaces.
+        build_failed_at=r"^(?:\./)?([^ \t\n:][^\n:]*\.go):[0-9]+:[0-9]+: ",
+        build_failed_summary=r"^FAIL\s+\S+\s+\[build failed\]",
         # A login shell (`sh -lc`, which mo-eval's local-suite workers use) sources /etc/profile,
         # which resets PATH to the Debian default and drops /usr/local/go/bin — so `go` is "not
         # found" in the very image that ships it, and a baseline "fails" for a reason that is not
@@ -236,8 +422,33 @@ LANGUAGES: dict[str, Language] = {
         inline_tests=False,
         test_command="./gradlew test",
         resolves_dependencies_when_testing=True,
-        filter_template="--tests *{name}*",
+        # `--tests` matches the WHOLE fully-qualified name, so `*.{name}` is anchored where
+        # `*{name}*` is a substring: measured on a project holding `testParsesHeader` and
+        # `testParsesHeaderWithCharset`, the old form ran both and the new one runs exactly one.
+        # That mattered in the false-RED direction here rather than the false-green one #4209
+        # opens with: `BUILD SUCCESSFUL` already needs every selected test to pass, so a neighbour
+        # could not carry a failing task — but a failing NEIGHBOUR could fail a run whose named
+        # test passed, and validation reads that as the task's own test failing.
+        #
+        # `--rerun` (the task-scoped one, Gradle 7.6+) because the proof is the build's verdict:
+        # a second run over unchanged inputs prints `Task :test UP-TO-DATE` and `BUILD SUCCESSFUL`
+        # having executed nothing at all. An older wrapper rejects the flag loudly, which costs a
+        # task rather than grading one wrongly.
+        filter_template="--rerun --tests *.{name}",
+        # Sound only WITH the filter above, and this is the pairing #4209 asks for: Gradle prints
+        # no per-test line for a pass, so the verdict is all there is — but the filter selects only
+        # the named test, a filter matching nothing fails with `No tests found for given includes`
+        # rather than succeeding vacuously, and `--rerun` denies it the up-to-date shortcut.
         ran_a_test=r"BUILD SUCCESSFUL",
+        # A failure IS named, with no reporter flag to ask for it: `HeaderTest > testParsesHeader()
+        # FAILED`. The leading `\b` is what refuses a suffix neighbour — there is no word boundary
+        # inside `testParsesHeader` of `testParsesHeaderWithCharset` — and the parentheses are
+        # optional because JUnit 5 prints them and JUnit 4 does not.
+        failed_a_test=r"\b{name}(\(\))? FAILED",
+        # `1 test completed, 1 failed` / `2 tests completed, 1 failed`. A compile failure prints
+        # neither this nor a named FAILED line, which is what keeps a broken environment out of
+        # both.
+        runner_reported=r"[0-9]+ tests? completed",
     ),
     "kotlin": Language(
         name="kotlin",
@@ -270,6 +481,9 @@ LANGUAGES: dict[str, Language] = {
         # same command reaches for `setuptools` and the worker fails before an agent starts.
         offline_env={"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": ".mo-eval-wheels"},
         ran_a_test=r"::{name}\b.*PASSED",
+        # Unanchored on purpose: `-q` prints `1 failed, 1 passed in 0.01s` while the default
+        # reporter wraps the same counts in `=====`, and the repository's own command chooses which.
+        runner_reported=r"[0-9]+ (passed|failed)",
         # No failure wording, so the start state is read from the exit code. `pytest` reports a
         # unittest subtest failure on its own lines and still prints `::{name} PASSED` for the test
         # that owns them, so both halves of a by-name reading are wrong here at once: nothing says
@@ -298,7 +512,22 @@ LANGUAGES: dict[str, Language] = {
         # `Tests  1 passed | 5192 skipped (5193)` — same filter flag, same anchoring, different
         # summary line. Measured against hono, which is Vitest; the colon alone made every probe
         # read as "no test ran", which rejects a whole repository for its reporter's punctuation.
-        ran_a_test=r"Tests:?\s+1 passed",
+        #
+        # Reporter-agnostic on purpose, and it has to stay that way: the Vitest contract is an
+        # ALTERNATE chosen only when the repository's test command contains the word `vitest`, so a
+        # project running Vitest through `npm test` lands HERE. A Jest-shaped proof, or a Jest-only
+        # flag in the filter, would break exactly those repositories to fix the others.
+        #
+        # `.*` before the count because `-t` does not SELECT tests in Jest — it skips the rest and
+        # still counts them — so a filtered run reads `Tests: 2 skipped, 1 passed, 3 total` and the
+        # count is not what follows the label. Anchored on `1 passed` as a whole word: it still
+        # refuses `3 passed` (a filter that matched three tests proves nothing about one) and is not
+        # satisfied by `11 passed` (#4197).
+        ran_a_test=r"Tests:?\s.*\b1 passed\b",
+        # Reads for both reporters too: Jest's `Tests: 0 total` and Vitest's `Tests  no tests` both
+        # carry no passed/failed count, which is what says the runner reported nothing. Never
+        # `Test Suites:`/`Test Files`, which report a failure for a suite that ran nothing.
+        runner_reported=r"Tests:?\s.*[0-9]+ (passed|failed)",
     ),
     "csharp": Language(
         name="csharp",
@@ -308,8 +537,25 @@ LANGUAGES: dict[str, Language] = {
         test_name=_pattern(r"(?:void|Task|async\s+Task)\s+(\w+)\s*\("),
         inline_tests=False,
         test_command="dotnet test",
-        filter_template="--filter FullyQualifiedName~{name}",
-        ran_a_test=r"Passed:\s+[1-9]",
+        # `--logger console;verbosity=detailed` is what makes `dotnet test` print a line PER TEST.
+        # Quoted because the template is `shlex.split` before it is filled and the semicolon would
+        # otherwise end the argument.
+        #
+        # `~` is CONTAINS, and vstest offers no anchored form for a bare method name — an exact
+        # `FullyQualifiedName=` needs the namespace and class, which a task's test name does not
+        # carry. So the filter stays a substring and the PROOF carries the identity, exactly as
+        # Rust's does for the same reason.
+        filter_template="--logger 'console;verbosity=detailed' --filter FullyQualifiedName~{name}",
+        # The test's own line, terminated by the duration the logger appends. Measured: a task named
+        # `ParsesHeader` also selects `ParsesHeaderWithCharset`, and the count this replaced could
+        # not tell them apart — so deleting the task's own test and leaving the neighbour passing
+        # exited ZERO with `Passed: 1` and was graded resolved (#4209). The ` \[` is what stops
+        # `ParsesHeader` being proven by `ParsesHeaderWithCharset`.
+        ran_a_test=r"Passed ([^ ]*\.)?{name} \[",
+        failed_a_test=r"Failed ([^ ]*\.)?{name} \[",
+        # The run summary, which a filter matching nothing does not print at all: it exits zero
+        # saying `No test matches the given testcase filter` and reports no counts.
+        runner_reported=r"(Failed|Passed):\s+[0-9]+",
     ),
     "ruby": Language(
         name="ruby",
@@ -408,6 +654,9 @@ ALTERNATES: dict[str, tuple[Language, ...]] = {
             # `grep -E`, which has none.
             filter_template=r"--reporter=verbose -t '(^|\s){name}$'",
             name_is_regex=True,
+            # `Tests`, never `Test Files`: the latter reads `1 failed (1)` for a file that never
+            # ran a thing, so it proves the opposite of what it looks like.
+            runner_reported=r"Tests\s+[0-9]",
             ran_a_test=r"✓.*> {name}( [0-9.]+m?s)?$",
             failed_a_test=r"×.*> {name}( [0-9.]+m?s)?$",
         ),

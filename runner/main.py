@@ -15,24 +15,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections import Counter
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from languages import LANGUAGES, Language, detect_framework, resolve_contract  # noqa: E402
-from runner.client import ServiceError, client_for  # noqa: E402
+from languages import LANGUAGES, Language, detect_framework, offline_setup, resolve_contract  # noqa: E402
+from runner.client import (REQUEST_BUDGET_BYTES, ServiceClient, ServiceError,  # noqa: E402
+                           client_for, plan_order_requests)
 from runner.collect import bounded_text, change_source, repo_facts, tracked_files  # noqa: E402
 from runner.config import CONFIG_PATH, ConfigError, RunnerConfig, load_config, probe_environment  # noqa: E402
 from runner.execute import (OrderError, Runner, _bounded_output, _end_group,  # noqa: E402
                             _export_into, _without_the_runners_credentials, commit_or_refuse)
-from wire import (ConventionSources, RepoFacts, ReviewComment, RunRequest, TaskPackage, UploadRequest,  # noqa: E402
-                  VerdictReport, Wire)
+from wire import (SCORER_IN_TREE, ChangeSource, ConventionSources, OrdersResponse,  # noqa: E402
+                  RejectionSummary, RepoFacts, ReviewComment, RunRequest, TaskPackage, UploadRequest,
+                  VerdictReport, WorkOrder, Wire)
 
 
 def _safe_relative(name: str, into: Path) -> Path:
@@ -188,9 +193,17 @@ def write_local_suite(package: TaskPackage, repo: Path, into: Path,
             # Declared and absent means the preparation did not produce what it promised — a typo, a
             # different path, a partial failure. Skipping it silently freezes a tree WITHOUT the
             # dependencies and ships a bundle that fails in a worker, which is the whole failure this
-            # declaration exists to prevent. The exception is a language default, which describes a
-            # typical repository rather than this one: `go mod vendor` writes no `vendor/` for a
-            # module with no dependencies, and that tree is complete as it stands.
+            # declaration exists to prevent.
+            #
+            # A language default is exempt, and the condition it must meet is narrower than
+            # "it describes a typical repository rather than this one" — that says why absence is
+            # POSSIBLE, not why absence is SAFE. What the skip needs is: for this language, a missing
+            # artifact means THERE WAS NOTHING TO VENDOR, never that the dependencies went somewhere
+            # else. Both defaults meet it, measured: `go mod vendor` and `cargo vendor` each write no
+            # `vendor/` for a project with no dependencies. Yarn's Plug'n'Play is the shape that does
+            # not — it writes no `node_modules` and resolves from a GLOBAL cache, so absence there
+            # would mean the dependencies are outside the tree entirely, and this skip would freeze a
+            # bundle no worker could score. That is why TypeScript ships no default (#4269).
             if config is not None and config.offline_prepare:
                 raise OrderError(
                     f"`offline_prepare` did not produce the declared artifact {artifact!r}; the task's "
@@ -201,7 +214,130 @@ def write_local_suite(package: TaskPackage, repo: Path, into: Path,
         # vendor/ would vanish between this tree and the worker that scores it.
         _bounded(git + ["add", "-f", artifact], cwd=root)
     _bounded(git + ["commit", "-q", "--no-verify", "-m", f"mo-eval start state for {package.task_id}"], cwd=root)
+    # AFTER the commit, deliberately: running a scorer leaves build artifacts, and the `add -A`
+    # above would have frozen them into the start tree — the same defect #4128 fixed for capture.
+    # The tree is restored to the committed state afterwards, so what ships is what was committed.
+    _refuse_a_task_its_own_image_cannot_score(root, meta, config)
     return root
+
+
+
+
+_SCORE_CHECK_SECONDS = 1800
+"""How long the packaging score-check may take.
+
+A scorer compiles before it runs — `cargo test` on a cold target directory is minutes — and this is
+the same work a worker does, so the bound is the worker's order of magnitude rather than a probe's.
+"""
+
+_SCORE_CHECK_TAIL_BYTES = 1200
+"""How much of a refused scorer's output is quoted back."""
+
+_TASK_SHAPED_EXIT = 1
+"""What the generated scorer exits when the named test ran and did not pass — the only answer that
+earns a bundle its place. `0` means the start state already passes and `3` means the test never ran;
+both are refusals, and the third is the one this check exists for."""
+
+
+def _refuse_a_task_its_own_image_cannot_score(
+    root: Path, meta: dict, config: RunnerConfig | None, run=None
+) -> None:
+    """Run this task's own scorer in its own worker image, and refuse a bundle that cannot be graded.
+
+    Validation ran the probes on THIS host. Scoring runs the generated scorer inside
+    `worker_image`, against a frozen tree, with no network. Nothing compared the two until here, and
+    a task can pass the first and be ungradeable in the second — measured on `sqlglot`, whose image
+    had no pytest, where setup exited zero and the scorer reported "did not pass" for a test that
+    could never run. Counted, and counted wrong.
+
+    The scorer is already in the tree and carries its own patterns, so this needs no contract
+    reading: the exit status alone separates the three answers. `1` is the task-shaped failure a
+    start state owes; `3` is the scorer saying nothing ran, which is the environment rather than the
+    task (#4139); `0` is a start state that already passes, which is no task at all.
+
+    Runs with `--network none`, as a worker does. With one, an install could fetch what a worker
+    cannot and the check would pass under an environment that will not exist at scoring time.
+
+    Raises:
+        OrderError: If the image cannot score the task, or the check cannot be carried out at all.
+    """
+    # `_bounded_output`, not `_bounded`: the scorer's exit code IS the answer here, and `_bounded`
+    # raises on any non-zero — including `1`, the one status that means the bundle is good.
+    run = run or _bounded_output
+    image = config.worker_image if config is not None else None
+    if not image:
+        # Nothing to disagree with: a repository that declares no image is scored wherever a worker
+        # happens to run, and this check has no second environment to compare against.
+        return
+    if shutil.which("docker") is None:
+        # The same refusal `_prepare_offline` makes, for the same reason: skipping the comparison
+        # silently is what leaves a bundle that looks complete and cannot be scored.
+        raise OrderError(
+            "this repository declares a worker image, but there is no `docker` on this runner to "
+            "score the task in it before shipping — a bundle no worker can grade would look complete"
+        )
+    contract = _contract_for(meta)
+    setup = meta.get("setup_cmd")
+    steps = [offline_setup(setup, contract)] if setup else []
+    steps.append(f"bash {shlex.quote(SCORER_IN_TREE)}")
+    container = f"mo-eval-score-check-{os.getpid()}-{root.name}"
+    try:
+        exit_code, tail, _, _ = run(
+            ["docker", "run", "--rm", "--name", container,
+             # As a worker scores: with none. Given a network, a setup could fetch what a worker
+             # cannot and the check would pass under an environment that will not exist later.
+             "--network", "none",
+             "--pids-limit", str(_OFFLINE_PREPARE_MAX_PIDS),
+             "--user", f"{os.getuid()}:{os.getgid()}",
+             "-e", f"HOME={_PREPARE_HOME}",
+             "-v", f"{root}:/mo-eval-tree", "-w", "/mo-eval-tree", "--entrypoint", "sh",
+             image, "-c", "; ".join(steps)],
+            cwd=root, timeout=_SCORE_CHECK_SECONDS,
+            env=_without_the_runners_credentials(os.environ, {}),
+        )
+    except BaseException:
+        # Killing the CLI does not stop a container — it is the daemon's child, and `--rm` fires
+        # only once it exits. Bounded like the preparation's kill: one that hangs would hold the CI
+        # job open, which is what this is preventing.
+        subprocess.run(["docker", "kill", container], capture_output=True, timeout=_GIT_SECONDS,
+                       check=False)
+        _restore_to_the_commit(root, best_effort=True)
+        raise
+    _restore_to_the_commit(root)
+    if exit_code == _TASK_SHAPED_EXIT:
+        return
+    # The scorer's own words, bounded: a refusal a person cannot act on is barely better than none.
+    tail = (tail or "")[-_SCORE_CHECK_TAIL_BYTES:]
+    if exit_code == 0:
+        raise OrderError(
+            f"{meta['task_id']}: the start state PASSES its own scorer inside {image} — there is no "
+            f"task here to solve, whatever the probes on this host reported\n{tail}"
+        )
+    raise OrderError(
+        f"{meta['task_id']}: this task's scorer exited {exit_code} inside {image}, not "
+        f"{_TASK_SHAPED_EXIT} — the image cannot grade the task, so no worker could either. A bundle "
+        f"shipped now would report every attempt as a failed task, including a correct one\n{tail}"
+    )
+
+
+def _restore_to_the_commit(root: Path, *, best_effort: bool = False) -> None:
+    """Put the tree back to the start state that was committed, discarding what the scorer built.
+
+    A scorer compiles and caches, and none of that is part of a task's start state. Restored to the
+    commit rather than cleaned selectively, so a toolchain that writes somewhere unexpected cannot
+    ship inside the bundle.
+
+    `best_effort` while an exception is already in flight: raising from here would replace a refusal
+    with a git error, so the reason a bundle was rejected would be the cleanup rather than the task.
+    """
+    git = ["git", "-c", "user.email=mo-eval@example.invalid", "-c", "user.name=mo-eval"]
+    for argv in (git + ["reset", "-q", "--hard"], git + ["clean", "-qfdx"]):
+        try:
+            _bounded(argv, cwd=root, timeout=_GIT_SECONDS)
+        except Exception:
+            if not best_effort:
+                raise
+            return
 
 
 _PREPARE_HOME = "/tmp"
@@ -494,8 +630,95 @@ def orders_asked_for(orders: list, candidates: int) -> list:
     return orders
 
 
+_MAX_MERGED_REASONS = 200
+"""How many distinct rejection reasons one merged tally keeps.
+
+The service composes these strings and the funnel prints the top few. Merging several responses is
+what makes the bound worth having: without it a service grows the runner's tally by a whole
+response's worth of distinct reasons per request, and packing decides how many requests there are.
+"""
+
+_MAX_HELD_ANSWER_CHARS = 256 * 1024 * 1024
+"""How much service-composed text the runner holds while assembling several answers into one.
+
+A count is not a size. `_MAX_MERGED_REASONS` bounds how many reasons are kept and
+`orders_asked_for` bounds how many orders arrive, and a service fills either bound with maximally
+large entries: `wire.MAX_STRING_CHARS` lets one string be 16 MiB, so two hundred of them is
+gigabytes inside both counts.
+
+Set to what one response could already hold (`client._MAX_RESPONSE_BYTES`), because that is the
+bound this stopped being: while there was one answer, the per-answer ceiling bounded what was held
+at once. Packing makes the number of answers follow the size of a repository's changes, so the same
+ceiling has to be stated across them.
+"""
+
+
+def _held_chars(answer: OrdersResponse) -> int:
+    """How much service-composed text one answer keeps alive.
+
+    Counted field by field rather than by re-encoding the answer, which would allocate exactly the
+    megabytes the bound exists to refuse.
+    """
+    total = sum(len(summary.reason) for summary in answer.rejections)
+    for order in answer.orders:
+        total += len(order.order_id)
+        for step in order.steps:
+            total += sum(len(text) for text in (step.op, step.step_id, step.commit or "", step.patch or "",
+                                                step.cwd or "", step.proof or "", step.counterproof or ""))
+            total += sum(len(argument) for argument in step.args or ())
+    return total
+
+TOO_LARGE_TO_SEND = "source is larger than one request to the service carries"
+"""Why a selected change was never asked about. A stable category with no size in it, so the funnel
+tallies every such change into one row rather than one row each."""
+
+
+def issue_orders(client: ServiceClient, wire: Wire, facts: RepoFacts, sources: list[ChangeSource],
+                 candidates: int) -> OrdersResponse:
+    """Ask the service for work orders and merge the answers into one response.
+
+    In as many requests as `plan_order_requests` says the selection needs, tallied so the funnel
+    reads them as it would have read one.
+
+    Each request is recorded as its own crossing, because it is one: `wire/` holds what was sent,
+    not what was assembled. A change no request can carry is named here instead of being sent.
+
+    Raises:
+        ServiceError: If the selection cannot be packed into any request, or a request fails.
+    """
+    planned = plan_order_requests(facts, sources, candidates)
+    for change_id, cost in planned.oversized.items():
+        print(f"  {change_id[:9]} not asked about: its source costs {cost:,} bytes, and one request "
+              f"to the service carries {REQUEST_BUDGET_BYTES:,}", file=sys.stderr)
+    orders: list[WorkOrder] = []
+    counts: Counter[str] = Counter()
+    if planned.oversized:
+        counts[TOO_LARGE_TO_SEND] = len(planned.oversized)
+    held = 0
+    for batch in planned.batches:
+        wire.crossing("up", "change-source", batch)
+        answer = wire.crossing("down", "work-orders", client.orders(facts, batch, candidates))
+        orders.extend(answer.orders)
+        # Both checked per request rather than only on the whole, because the whole is now assembled
+        # from several answers: a service that overruns stops at the first one instead of after the
+        # runner has held every batch's worth of it.
+        orders_asked_for(orders, candidates)
+        held += _held_chars(answer)
+        if held > _MAX_HELD_ANSWER_CHARS:
+            raise ServiceError(f"the service's answers hold {held:,} characters across "
+                               f"{len(orders)} order(s); at most {_MAX_HELD_ANSWER_CHARS:,}")
+        for summary in answer.rejections:
+            if summary.reason in counts or len(counts) < _MAX_MERGED_REASONS:
+                counts[summary.reason] += summary.count
+    return OrdersResponse(orders=orders,
+                          rejections=[RejectionSummary(reason, count) for reason, count in counts.most_common()])
+
+
 def suite(arguments: argparse.Namespace) -> int:
     repo = arguments.repo.resolve()
+    # Before anything can fail: `--out` may be reused, and a funnel record left by the previous
+    # run would tell the Action's summary step that this run reported one.
+    (arguments.out.resolve() / FUNNEL_RECORD).unlink(missing_ok=True)
     try:
         config = load_config(repo / arguments.config)
     except ConfigError as failure:
@@ -528,9 +751,8 @@ def suite(arguments: argparse.Namespace) -> int:
     try:
         request = wire.crossing("down", "source-request", client.select(facts, arguments.candidates))
         request = replace(request, change_ids=asked_for(request.change_ids, facts, arguments.candidates))
-        sources = wire.crossing("up", "change-source", change_source(repo, facts, request.change_ids))
-        response = wire.crossing("down", "work-orders", client.orders(facts, sources, arguments.candidates))
-        response = replace(response, orders=orders_asked_for(response.orders, arguments.candidates))
+        sources = change_source(repo, facts, request.change_ids, resolve_contract(contract))
+        response = issue_orders(client, wire, facts, sources, arguments.candidates)
     except ServiceError as failure:
         print(f"service: {failure}", file=sys.stderr)
         return 1
@@ -538,7 +760,8 @@ def suite(arguments: argparse.Namespace) -> int:
     orders = response.orders[: arguments.validate] if arguments.validate else response.orders
     if arguments.dry_run:
         print(f"  --dry-run: {len(orders)} order(s) issued, none run")
-        _funnel(facts, request, response, 0, VerdictReport([]), [], dry_run=True)
+        _funnel(facts, request, response, len(orders), VerdictReport([]), [], dry_run=True,
+                record=out / FUNNEL_RECORD)
         return 0
     runner = Runner(repo=repo, workspaces=out / "workspaces", test_command=config.test_command,
                     env=environment, setup_command=config.setup_command,
@@ -577,7 +800,8 @@ def suite(arguments: argparse.Namespace) -> int:
             if bundle is not None:
                 print(f"             local-suite bundle → {bundle}")
 
-    _funnel(facts, request, response, len(orders), report, written)
+    _funnel(facts, request, response, len(orders), report, written, evidence=_evidence(results, report),
+            record=out / FUNNEL_RECORD)
     if written and arguments.run:
         conventions = _conventions(repo, facts.repo, min(arguments.history, 120))
         try:
@@ -632,6 +856,12 @@ def _recent_merged(repo: Path, repo_name: str, limit: int) -> list[int]:
     return [int(n) for n in out.split()]
 
 
+_SUITE_MANIFEST = ".mo-eval/suite.yaml"
+"""What makes a bundle scoreable. `local_suite_files` writes it alongside the prompt and the
+acceptance script, and `mo-eval plan` refuses a bundle without it — so its absence is exactly the
+thing the lane would discover, discovered here instead."""
+
+
 def _hand_off(client, repo_name: str, out: Path, routes: list[str], repeats: int,
               conventions: ConventionSources | None = None,
               harnesses: list[str] | None = None) -> None:
@@ -647,6 +877,23 @@ def _hand_off(client, repo_name: str, out: Path, routes: list[str], repeats: int
     bundles = sorted(p for p in suite_dir.iterdir() if p.is_dir()) if suite_dir.is_dir() else []
     if not bundles:
         print("  nothing to hand off: no local-suite bundles (does the config declare worker_image?)")
+        return
+    # A bundle whose build failed is still a DIRECTORY: `write_local_suite` creates the root, exports
+    # the start tree into it, and only then lays the overlay over it — so a failure in between leaves
+    # a tree with no `.mo-eval/`. Handed off, nothing downstream notices (the upload checks sizes, and
+    # `/v1/runs` checks that each task has a validated reference, which it does), and the lane finds
+    # out by claiming the job, exporting every bundle and failing at `mo-eval plan`. That reports a
+    # failure in the customer's CI as a planning failure on our lane, minutes later, having spent a
+    # claim. Checked here rather than in `suite` so `submit --out <dir>` is covered by the same rule.
+    unscoreable = [bundle.name for bundle in bundles if not (bundle / _SUITE_MANIFEST).is_file()]
+    if unscoreable:
+        print(f"  not handing off {len(unscoreable)} bundle(s) with no {_SUITE_MANIFEST}: "
+              f"{', '.join(unscoreable)}", file=sys.stderr)
+        print("  their tasks are still valid and still runnable with `--service local`; the bundle "
+              "build is what failed, above.", file=sys.stderr)
+        bundles = [bundle for bundle in bundles if bundle.name not in set(unscoreable)]
+    if not bundles:
+        print("  nothing to hand off: no bundle carries a suite to score", file=sys.stderr)
         return
     task_ids = [p.name for p in bundles]
     suite_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{task_ids[0][-8:]}"
@@ -708,9 +955,23 @@ def _hand_off(client, repo_name: str, out: Path, routes: list[str], repeats: int
     print(f"  run {ticket.run_id} recorded ({ticket.job_key}); results will appear under {ticket.results_prefix}")
 
 
-def _funnel(facts, request, response, ran: int, report, written: list[Path], *, dry_run: bool = False) -> None:
+FUNNEL_RECORD = "funnel.txt"
+"""Where under `--out` the funnel block is kept. The Action's summary step reads it to know the
+runner got as far as reporting a funnel: `GITHUB_STEP_SUMMARY` is a different file for every step,
+so the block the runner appended to its own is invisible to the step that follows."""
+
+
+def _funnel(facts, request, response, ran: int, report, written: list[Path], *, dry_run: bool = False,
+            evidence: str = "", record: Path | None = None) -> None:
     """Where every offered change went. The number a user needs is not how many tasks they got,
-    but why they did not get more."""
+    but why they did not get more. `ran` is how many orders ran, or on a dry run how many would
+    have, which `--validate` may cap below the orders issued.
+
+    Printed, appended to the job summary where there is one (`GITHUB_STEP_SUMMARY`), since a suite
+    that yielded nothing is exactly when the funnel has to be in front of the reader, and kept at
+    `record` for the step that reads the summary after this one. `evidence` is `_evidence`'s
+    report, placed after the funnel in all three.
+    """
     offered = len(facts.changes)
     notes = []
     if facts.unresolved_changes:
@@ -722,20 +983,152 @@ def _funnel(facts, request, response, ran: int, report, written: list[Path], *, 
     if facts.source != "github-prs":
         notes.append(f"read from git log, squash merges only: {facts.source_note or 'forge not consulted'}")
     suffix = f"  ({'; '.join(notes)})" if notes else ""
-    print(f"\n  offered    {offered:>4} merged changes via {facts.source}{suffix}")
-    print(f"  selected   {len(request.change_ids):>4}   " + _reasons(request.rejections))
-    print(f"  orders     {len(response.orders):>4}   " + _reasons(response.rejections))
+    lines = [f"offered    {offered:>4} merged changes via {facts.source}{suffix}",
+             f"selected   {len(request.change_ids):>4}   " + _reasons(request.rejections),
+             f"orders     {len(response.orders):>4}   " + _reasons(response.rejections)]
     if dry_run:
         # Nothing ran, so nothing survived or failed to; saying so would misread a dry run as a
         # repository that yields nothing.
-        print(f"  validated     —   (dry run: {len(response.orders)} order(s) would run)")
-        return
-    validated = sum(1 for v in report.verdicts if v.validated)
-    print(f"  validated  {validated:>4} of {ran} run")
-    for path in written:
-        print(f"             → {path}")
-    if not written:
-        print("\n  no task survived; the stage that emptied the funnel is the one to look at")
+        lines.append(f"validated     —   (dry run: {ran} order(s) would run)")
+        diagnosis = ""
+    else:
+        validated = sum(1 for v in report.verdicts if v.validated)
+        lines.append(f"validated  {validated:>4} of {ran} run")
+        lines += [f"           → {path}" for path in written]
+        diagnosis = _diagnosis(request, response, report, ran=ran) if not written else ""
+    if evidence:
+        lines += ["", *evidence.rstrip("\n").splitlines()]
+    if diagnosis:
+        lines += ["", diagnosis]
+    # Cleaned at the sink, every line alike, since this is the one place the block leaves. A
+    # rejection's wording can carry a line of probe output: a reporter may have coloured it, and a
+    # newline in it would put whatever follows at the start of a line of its own — where `::` is a
+    # workflow command to Actions and three backticks would close a fence of three in the summary.
+    lines = [_ANSI.sub("", line).replace("\n", " ") for line in lines]
+    print()
+    for line in lines:
+        print(f"  {line}")
+    block = "\n".join(["### funnel", "````", *lines, "````", ""])
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write("\n" + block)
+    if record is not None:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(block, encoding="utf-8")
+
+
+_ORDER_CHANGE = re.compile(r"^validate-([0-9a-f]{12})(?:-|$)")
+"""The change an order validates, as the service spells an order id (`validate-<change>-<suffix>`);
+a verdict names the change, and the two are joined here. An id of another shape joins nothing."""
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_COUNTS = re.compile(r"[0-9]+")
+_EVIDENCE_LINES = 12
+"""How much of a probe's tail the log shows for one rejection: enough for pytest's collection error
+or Go's compile error and its summary, which is what a reader needs to place the failure."""
+
+
+def _kind(verdict) -> str:
+    """A rejection's wording with its counts taken out, so `2 graded test(s) did not run` and
+    `4 graded test(s) did not run` are one kind of failure, which they are."""
+    return _COUNTS.sub("N", verdict.detail)
+
+
+def _evidence(results, report) -> str:
+    """One probe tail per kind of rejection and per way the tail ends: the first failing step's
+    last lines, from the first order rejected that way.
+
+    The tail is the evidence a verdict rests on, and it was readable only from the artifact.
+    pydantic's eight identical rejections were two causes, a missing test dependency and a
+    pydantic-core older than the commit expected, and the tail's last line is what tells them
+    apart. Returned for `_funnel` to place.
+    """
+    by_order = {found.group(1): result for result in results
+                if (found := _ORDER_CHANGE.match(result.order_id))}
+    tails = []
+    for verdict in report.verdicts:
+        if verdict.validated:
+            continue
+        result = by_order.get(verdict.change_id[:12])
+        step = next((step for step in (result.steps if result else []) if step.exit_code != 0), None)
+        lines = _ANSI.sub("", step.output_tail).strip().splitlines() if step else []
+        tails.append((verdict, step, lines))
+    per_kind = Counter(_kind(verdict) for verdict, _, _ in tails)
+    alike = Counter((_kind(verdict), lines[-1] if lines else "") for verdict, _, lines in tails)
+    printed: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for verdict, step, lines in tails:
+        key = (_kind(verdict), lines[-1] if lines else "")
+        if step is None or key in seen:
+            continue
+        seen.add(key)
+        share = (f" ({alike[key]} of {per_kind[key[0]]} rejected this way end like this)"
+                 if per_kind[key[0]] > 1 else "")
+        printed.append(f"evidence  {verdict.change_id[:9]}  {step.step_id} exited {step.exit_code}{share}")
+        printed += [f"           | {line}" for line in lines[-_EVIDENCE_LINES:]]
+    return "\n".join(printed) + ("\n" if printed else "")
+
+
+_HINTS = (
+    ("merged more than", "The history window reaches past the age limit, so the repository merges rarely; "
+                         "recency is not fit. A repository with recent merged work, or a smaller --history."),
+    ("touches no source file", "Most of what the repository merges is docs, CI or tests. If it plainly has "
+                               "source under an unusual layout, the language contract is not recognising it; "
+                               "survey.py reports the share it claims."),
+    ("the reference state does not pass", "The repository's own tests do not run at the maintainers' own "
+                                          "commit in this job: usually a test dependency or setup_command the "
+                                          "job did not install, or a dependency the commit pins differently "
+                                          "from the checkout. The evidence above says which."),
+    ("did not run at the start state", "The graded tests were not seen running; the evidence above shows what "
+                                       "the probe printed instead."),
+    ("could not be set up", "The start tree could not be prepared in this job; the evidence above names the file."),
+    ("does not build", "The start tree does not compile in this job; the evidence above names the file."),
+    ("writes no test", "The selected changes carry no test of their own, so nothing states the task; a "
+                       "repository whose fixes land without tests yields little."),
+    (TOO_LARGE_TO_SEND, "Those changes touch more file content than one request carries, so they were "
+                        "never asked about; the rest of the selection was. Too big to carry rather "
+                        "than unfit — a smaller --candidates does not help, since each is already "
+                        "weighed on its own."),
+)
+"""What a dominant rejection reason usually means, in words a reader can act on. Keyed by a phrase
+of the reason, since that wording is the contract a reader already sees — the service's own for
+every entry but the last, which the runner composes when a change cannot be sent at all."""
+
+
+def _dominant(tally) -> tuple[int, str]:
+    top = max(tally, key=lambda rejection: rejection.count)
+    return top.count, top.reason
+
+
+def _diagnosis(request, response, report, *, ran: int) -> str:
+    """Which stage emptied the funnel, its dominant reason, and what that usually means.
+
+    Eight identical rejections are the signature of a missing dependency rather than of eight unfit
+    changes, and 159 of 293 `touches no source file` is a repository that merges docs and CI; the
+    reader is told that rather than left to infer it. Empty when something survived.
+    """
+    if any(verdict.validated for verdict in report.verdicts):
+        return ""
+    if not request.change_ids:
+        if not request.rejections:
+            return "nothing survived selection: the repository offered no merged changes to select from"
+        stage, total, unit = "selection", sum(rejection.count for rejection in request.rejections), "offered"
+        count, reason = _dominant(request.rejections)
+    elif not response.orders:
+        if not response.rejections:
+            return "nothing survived the split, and the service gave no reason"
+        stage, total, unit = "the split", len(request.change_ids), "selected"
+        count, reason = _dominant(response.rejections)
+    else:
+        if not report.verdicts:
+            return "nothing survived validation: no verdicts came back"
+        stage, total, unit = "validation", ran, "run"
+        kinds = Counter(_kind(verdict) for verdict in report.verdicts)
+        kind, count = kinds.most_common(1)[0]
+        reason = next(verdict.detail for verdict in report.verdicts if _kind(verdict) == kind)
+    hint = next((hint for phrase, hint in _HINTS if phrase in reason), "")
+    sentence = f"nothing survived {stage}: {count} of {total} {unit} {reason}"
+    return f"{sentence}. {hint}" if hint else sentence
 
 
 def _reasons(rejections) -> str:
