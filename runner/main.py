@@ -158,7 +158,7 @@ def _bounded(argv: list[str], *, cwd: Path, timeout: float = _GIT_SECONDS,
 
 
 def write_local_suite(package: TaskPackage, repo: Path, into: Path,
-                      config: RunnerConfig | None = None) -> Path | None:
+                      config: RunnerConfig | None = None, cache: Path | None = None) -> Path | None:
     """Materialize `into/<task_id>/` as a one-task local-test-suite over the task's start tree.
 
     The start tree is rebuilt the way the validation order built it — the parent commit exported,
@@ -184,7 +184,8 @@ def write_local_suite(package: TaskPackage, repo: Path, into: Path,
     _write_without_following(root / ".mo-eval-scaffold.patch", package.files["scaffold.patch"])
     _bounded(["git", "apply", "--whitespace=nowarn", ".mo-eval-scaffold.patch"], cwd=root, timeout=_APPLY_SECONDS)
     (root / ".mo-eval-scaffold.patch").unlink()
-    _prepare_offline(root, meta, config=config)
+    _prepare_offline(root, meta, config=config, cache=cache)
+    _resolve_symlinks(root)
     _write_all(package.local_suite, root, "local suite")
     _bounded(git + ["add", "-A"], cwd=root)
     for artifact in _offline_artifacts(meta, config):
@@ -340,6 +341,43 @@ def _restore_to_the_commit(root: Path, *, best_effort: bool = False) -> None:
             return
 
 
+def _discard_the_preparation_cache(cache: Path) -> None:
+    """Remove the suite's shared cache once every bundle is built.
+
+    Disk is the limit that actually binds a suite (#4277), and the cache is the one thing this
+    change ADDS to it — 189 MB for `gin`, whose closure is small. The peak is not here but in
+    hand-off, which holds every tree AND every archive at once, so the cache is discarded before
+    that and the saving on downloads costs no headroom at all.
+
+    A Go module cache is deliberately read-only, and it is the DIRECTORIES that block removal: a
+    file is unlinked from its parent, so 0444 on the file costs nothing and 0555 on the directory
+    holding it refuses every unlink inside it. Restoring write permission as errors arrive does not
+    work for that reason — the path that raises is the file, and the path that must change is its
+    parent. So the directories are made writable first, deliberately, and then the tree goes.
+
+    Best effort: a cache that will not delete is not worth failing a suite over, since the job's
+    temporary directory goes when the job does.
+    """
+    for directory, _, _ in os.walk(cache):
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+    shutil.rmtree(cache, ignore_errors=True)
+
+
+def _cache_environment(cache: Path, contract) -> tuple[str, ...]:
+    """Docker arguments mounting the suite's shared preparation cache and pointing a toolchain at it.
+
+    The mount alone shares only what a toolchain keeps under HOME, which for an official image is
+    usually not the download. `prepare_cache_env` names the variable that moves the rest.
+    """
+    arguments = ["-v", f"{cache}:{_PREPARE_HOME}"]
+    for name, relative in sorted((contract.prepare_cache_env if contract is not None else {}).items()):
+        arguments += ["-e", f"{name}={PurePosixPath(_PREPARE_HOME) / relative}"]
+    return tuple(arguments)
+
+
 _PREPARE_HOME = "/tmp"
 """HOME inside the preparation container: somewhere the runner's uid may actually write.
 
@@ -390,6 +428,64 @@ def _require_within(root: Path, artifact: str) -> None:
         raise OrderError(f"offline artifact {artifact!r} climbs out of the repository")
 
 
+def _resolve_symlinks(root: Path) -> None:
+    """Replace every symlink in the start tree with what it points at.
+
+    A lane refuses a bundle carrying any member that is not a regular file or a directory
+    (`lane/dispatch.py`), because a symlink in an archive is how an unpacker is made to write
+    outside the directory it was given. That refusal is right, and it arrives at the worst possible
+    moment: after mining, validation, archiving and upload, four seconds into the lane, reported as
+    a tar type flag. Measured on `momentohq/pydantic`, whose `CONTRIBUTING.md` is a link to
+    `docs/contributing.md` — two validated tasks uploaded and neither could be scored.
+
+    So the tree is made honest here instead. A link to something inside the tree becomes a copy of
+    it, which is what the agent and the scorer would have read through the link anyway. A link
+    pointing OUTSIDE the tree is refused, because there is nothing to copy that the worker would
+    have had: the target is on the machine that built the bundle and nowhere else.
+
+    Vendoring runs first, deliberately — pnpm builds `node_modules` out of links into its own store,
+    and those are exactly the links the lane would reject.
+
+    Raises:
+        OrderError: If a link points outside the tree, or at nothing.
+    """
+    root = root.resolve()
+    # Collected before anything is replaced: resolving a link to a directory rewrites the tree
+    # underneath an in-progress walk, and `rglob` would then descend into the copy it just made.
+    links = sorted((path for path in root.rglob("*") if path.is_symlink()), key=lambda path: len(path.parts))
+    for link in links:
+        if not link.is_symlink():
+            # Already replaced, as part of a directory copied for an earlier link.
+            continue
+        try:
+            target = link.resolve(strict=True)
+        except (OSError, RuntimeError) as unreadable:
+            raise OrderError(f"{link.relative_to(root)} is a link to nothing a worker could follow "
+                             f"({unreadable}); the task cannot be scored") from unreadable
+        if not target.is_relative_to(root):
+            raise OrderError(f"{link.relative_to(root)} points outside the task's tree ({target}); a "
+                             f"worker has only the tree, so there is nothing there to follow")
+        # A link to one of its own ancestors — `sub/current -> ..`, a convenience some repositories
+        # keep — is inside the tree and still cannot be copied: `copytree` would walk the destination
+        # it is creating, and the failure is a path-length error or a `RecursionError` depending on
+        # the platform. The second is not an `OSError`, so on Linux it escapes the handler around
+        # this and ends the whole suite rather than the one task.
+        #
+        # Refused rather than resolved, for the same reason as the case above: there is no copy that
+        # is the truth. Everything under such a link is already in the tree at its own path, so what
+        # would be lost is an alias, and silently dropping one could change what a test reads.
+        location = link.parent.resolve() / link.name
+        if target.is_dir() and location.is_relative_to(target):
+            raise OrderError(f"{link.relative_to(root)} points at its own ancestor ({target}); a copy "
+                             f"of a directory into itself has no end, and the tree already holds "
+                             f"everything the link reaches")
+        link.unlink()
+        if target.is_dir():
+            shutil.copytree(target, link, symlinks=False)
+        else:
+            shutil.copy2(target, link)
+
+
 def _refuse_a_bundle_no_worker_could_score(meta: dict, config: RunnerConfig | None) -> None:
     """Refuse to write a bundle whose dependencies nothing puts into its tree.
 
@@ -429,7 +525,8 @@ def _refuse_a_bundle_no_worker_could_score(meta: dict, config: RunnerConfig | No
     )
 
 
-def _prepare_offline(root: Path, meta: dict, run=None, config: RunnerConfig | None = None) -> None:
+def _prepare_offline(root: Path, meta: dict, run=None, config: RunnerConfig | None = None,
+                     cache: Path | None = None) -> None:
     """Make the start tree scorable with no network, the way its language does that.
 
     mo-eval's baseline and scorer workers have no network at all — the first live run failed on
@@ -444,6 +541,13 @@ def _prepare_offline(root: Path, meta: dict, run=None, config: RunnerConfig | No
     executes the checked-out build script, at a commit the service chose. So it is given the same
     environment a probe gets — this runner's own credentials removed — rather than the job's whole
     environment, which carries the forge token and the pair that mints an OIDC identity.
+
+    `cache` is a directory mounted as the container's HOME so the toolchain cache survives between
+    tasks. Every task of a suite resolves the same dependency closure, and without it each one
+    re-downloads the whole thing: measured on `gin`, 7s cold against 1s warm, and gin's closure is
+    a small one. Scoped to the suite's own output directory and so to the CI job, deliberately —
+    the redundancy is entirely within one invocation, and a cache outliving the job on a
+    self-hosted runner would be reachable by a second repository.
 
     Raises:
         OrderError: If the preparation fails or does not finish. A bundle that cannot be scored
@@ -501,6 +605,16 @@ def _prepare_offline(root: Path, meta: dict, run=None, config: RunnerConfig | No
                  # GitHub Actions runner (#4137). One writable HOME answers all of them at once.
                  "--user", f"{os.getuid()}:{os.getgid()}",
                  "-e", f"HOME={_PREPARE_HOME}",
+                 # Shared with the other tasks of this suite, so the closure is fetched once rather
+                 # than once per task. Mounted only here: the score check below must keep starting
+                 # cold, for the same reason it runs with `--network none`.
+                 #
+                 # The mount is not enough on its own. An official image sets the toolchain's own
+                 # cache variable, and then the cache lands outside HOME however HOME is set —
+                 # `golang:1-bookworm` ships `GOPATH=/go`, so the module cache ignored a shared HOME
+                 # entirely and two tasks still fetched everything twice. The contract names what to
+                 # point back, per language and measured.
+                 *(_cache_environment(cache, contract) if cache is not None else ()),
                  "-v", f"{root}:/mo-eval-tree", "-w", "/mo-eval-tree", "--entrypoint", "sh",
                  image, "-c", prepare],
                 cwd=root, timeout=_OFFLINE_PREPARE_SECONDS,
@@ -785,13 +899,19 @@ def suite(arguments: argparse.Namespace) -> int:
         return 1
 
     written = []
+    # One toolchain cache for every task of this suite. A sibling of `local-suite/`, never inside a
+    # bundle: `write_local_suite` force-adds the declared offline artifacts, and a cache under a
+    # task's tree would be frozen into the start state and shipped to every worker.
+    prepare_cache = out / ".prepare-cache"
+    prepare_cache.mkdir(parents=True, exist_ok=True)
     for verdict in report.verdicts:
         mark = "VALIDATED" if verdict.validated else "rejected "
         print(f"  {mark} {verdict.change_id[:9]}  {verdict.detail}")
         if verdict.task is not None:
             written.append(write_package(verdict.task, out / "tasks"))
             try:
-                bundle = write_local_suite(verdict.task, repo, out / "local-suite", config)
+                bundle = write_local_suite(verdict.task, repo, out / "local-suite", config,
+                                           cache=prepare_cache)
             except (OrderError, ValueError, OSError) as failure:
                 # The task itself is already written and still valid. Only its containerized
                 # bundle could not be built, and one task's bundle failing is not the suite's end.
@@ -799,6 +919,8 @@ def suite(arguments: argparse.Namespace) -> int:
                 continue
             if bundle is not None:
                 print(f"             local-suite bundle → {bundle}")
+    # Before hand-off, which is where disk peaks: it holds every tree AND every archive at once.
+    _discard_the_preparation_cache(prepare_cache)
 
     _funnel(facts, request, response, len(orders), report, written, evidence=_evidence(results, report),
             record=out / FUNNEL_RECORD)
@@ -982,6 +1104,11 @@ def _funnel(facts, request, response, ran: int, report, written: list[Path], *, 
         notes.append(f"{facts.renaming_changes} rename a source file, which cannot be scaffolded yet")
     if facts.source != "github-prs":
         notes.append(f"read from git log, squash merges only: {facts.source_note or 'forge not consulted'}")
+    elif facts.source_note:
+        # The forge answered, but not from where the reader would assume — a repository that renamed
+        # its default branch is mined from the branch its history actually targets, and saying so is
+        # the difference between a number a reader can trust and one they cannot.
+        notes.append(facts.source_note)
     suffix = f"  ({'; '.join(notes)})" if notes else ""
     lines = [f"offered    {offered:>4} merged changes via {facts.source}{suffix}",
              f"selected   {len(request.change_ids):>4}   " + _reasons(request.rejections),

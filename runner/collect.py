@@ -12,6 +12,7 @@ handful of changes the service asked for.
 from __future__ import annotations
 
 import json
+from collections import Counter
 import os
 import re
 import signal
@@ -238,17 +239,19 @@ class _ForgeUnavailable(RuntimeError):
     """The forge could not be asked — no `gh`, not authenticated, no remote, or it answered garbage."""
 
 
-def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
-    """The merged record as the forge sees it: one entry per pull request, whatever the strategy."""
-    branch = str(named["branch"])
-    limit = int(named["limit"])  # type: ignore[call-overload]
+def _merged_pulls(repo: Path, repo_name: str, branch: str, limit: int) -> list:
+    """Merged pull requests targeting `branch`, as the forge reports them.
+
+    Raises:
+        _ForgeUnavailable: If the forge could not answer, or answered with something unreadable.
+    """
     try:
         listing = subprocess.run(
             # `-R` names the repository whose pull requests are the merged record. A fork's own PR
             # list is empty, but its git history holds every upstream merge commit — so a customer
             # mining a fork declares `repo = "upstream/name"` and the export still comes from the
             # local clone.
-            ["gh", "pr", "list", "-R", str(named["repo_name"]), "--state", "merged", "--base", branch,
+            ["gh", "pr", "list", "-R", repo_name, "--state", "merged", "--base", branch,
              "--limit", str(limit), "--json", _PR_FIELDS],
             cwd=repo, capture_output=True, text=True, timeout=300, check=True,
         ).stdout
@@ -261,6 +264,58 @@ def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
         raise _ForgeUnavailable(f"gh pr list: {failure}") from failure
     if not isinstance(pulls, list):
         raise _ForgeUnavailable("unexpected listing shape")
+    return pulls
+
+
+def _busiest_base(repo: Path, repo_name: str, limit: int) -> tuple[str, int]:
+    """The branch most recent merged pull requests target, and how many of them do.
+
+    Asked only when the default branch yielded nothing, to tell a renamed default from a quiet
+    repository. Reads one field, because the answer is a branch name rather than a change.
+
+    Returns:
+        The branch and its count, or `("", 0)` when the forge cannot say.
+    """
+    try:
+        listing = subprocess.run(
+            ["gh", "pr", "list", "-R", repo_name, "--state", "merged", "--limit", str(limit),
+             "--json", "baseRefName"],
+            cwd=repo, capture_output=True, text=True, timeout=300, check=True,
+        ).stdout
+        bases = [entry.get("baseRefName") for entry in json.loads(listing)]
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, AttributeError, TypeError):
+        # A probe, not the record. It runs on the way to reporting nothing, so failing it changes
+        # the message and never the outcome.
+        return "", 0
+    counted = Counter(base for base in bases if base)
+    if not counted:
+        return "", 0
+    return counted.most_common(1)[0]
+
+
+def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
+    """The merged record as the forge sees it: one entry per pull request, whatever the strategy."""
+    branch = str(named["branch"])
+    limit = int(named["limit"])  # type: ignore[call-overload]
+    repo_name = str(named["repo_name"])
+    pulls = _merged_pulls(repo, repo_name, branch, limit)
+    note = ""
+    if not pulls:
+        # An empty listing against the default branch is indistinguishable from a repository with no
+        # merged work, and the two call for opposite responses. A repository that RENAMED its default
+        # branch has a default its history never targeted: `clap-rs/clap` defaults to `main` and all
+        # 300 of its recent merged pull requests target `master`, so the listing is empty and the
+        # funnel reported a repository with nothing to mine — the one diagnosis a reader accepts
+        # without checking, because it is also a real outcome.
+        #
+        # So ask the forge where the merges actually went before concluding. One unfiltered listing
+        # is the whole cost, and it only runs when the answer was going to be "nothing" anyway.
+        elsewhere, count = _busiest_base(repo, repo_name, limit)
+        if elsewhere and elsewhere != branch:
+            pulls = _merged_pulls(repo, repo_name, elsewhere, limit)
+            note = (f"no merged pull request targets the default branch {branch!r}; "
+                    f"{count} of the most recent target {elsewhere!r}, which is what was mined")
+            branch = elsewhere
 
     changes: list[ChangeFacts] = []
     unresolved = 0
@@ -303,7 +358,7 @@ def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
         test_command=str(named["test_command"]), changes=changes,
         setup_command=named["setup_command"],  # type: ignore[arg-type]
         source="github-prs", unresolved_changes=unresolved, renaming_changes=renaming,
-        protocol=PROTOCOL,
+        source_note=note, protocol=PROTOCOL,
     )
 
 

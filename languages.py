@@ -139,6 +139,20 @@ class Language:
     precedence over the file when both are present — measured on a repository pinning an unreachable
     mirror, where the argument form runs the tests and the appended stanza fails to parse.
     """
+    prepare_cache_env: dict[str, str] = field(default_factory=dict)
+    """Where this toolchain keeps its download cache, relative to the preparation container's HOME.
+
+    Every task of a suite resolves the same dependency closure, so the preparation container is
+    given one shared directory as HOME and the closure is fetched once rather than once per task.
+    HOME alone does not achieve that: an official image usually sets the toolchain's own variable,
+    and then the cache lands outside HOME whatever HOME is. Measured in `golang:1-bookworm`, whose
+    `GOPATH=/go` puts the module cache at `/go/pkg/mod` and leaves only the build cache under HOME:
+
+        HOME=/tmp  go env GOMODCACHE -> /go/pkg/mod
+
+    So each entry names the variable and a path under HOME for it to point at. Empty for a language
+    nobody has measured, which costs only the sharing — the preparation still runs.
+    """
     offline_env: dict[str, str] = field(default_factory=dict)
     """Environment that makes this toolchain resolve dependencies from the tree instead of a network.
 
@@ -412,6 +426,8 @@ LANGUAGES: dict[str, Language] = {
         scorer_preamble='command -v go >/dev/null 2>&1 || export PATH="$PATH:/usr/local/go/bin:/go/bin"',
         offline_prepare="go mod vendor",
         offline_artifacts=("vendor",),
+        # `GOPATH` moves the module cache, which is the download; `GOCACHE` already follows HOME.
+        prepare_cache_env={"GOPATH": "go"},
     ),
     "java": Language(
         name="java",
