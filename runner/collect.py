@@ -12,24 +12,26 @@ handful of changes the service asked for.
 from __future__ import annotations
 
 import json
-from collections import Counter
 import os
 import re
 import signal
 import subprocess
 import threading
-from fnmatch import fnmatch
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import replace
+from fnmatch import fnmatch
 from pathlib import Path
+from typing import Any as JSONAny
+from typing import TypedDict, Unpack
 
 from languages import Language, is_source_path
 from wire import PROTOCOL, ChangeFacts, ChangeSource, FileFacts, FileSource, RepoFacts
 
 _NUMSTAT = re.compile(r"^(\d+|-)\t(\d+|-)\t(.+)$")
 _PACKAGE_NAME = re.compile(r'^\s*name\s*=\s*"([^"]+)"', re.MULTILINE)
-_WORKSPACE_TABLE = re.compile(r'^\[workspace\]', re.MULTILINE)
-_MEMBERS_BLOCK = re.compile(r'^members\s*=\s*\[(.*?)\]', re.MULTILINE | re.DOTALL)
+_WORKSPACE_TABLE = re.compile(r"^\[workspace\]", re.MULTILINE)
+_MEMBERS_BLOCK = re.compile(r"^members\s*=\s*\[(.*?)\]", re.MULTILINE | re.DOTALL)
 _MAX_FILE_BYTES = 512 * 1024
 _MAX_PROSE_CHARS = 20_000
 """How much of a pull request's or an issue's prose is kept. Written by whoever opened it, held for
@@ -49,6 +51,9 @@ def _git(repo: Path, *args: str) -> str:
     Raises:
         subprocess.CalledProcessError: If git exits non-zero.
         subprocess.TimeoutExpired: If it does not finish.
+
+    Returns:
+        The command's standard output, including its trailing whitespace.
     """
     return subprocess.run(
         ["git", *args],
@@ -80,7 +85,7 @@ def _end_listing(group: int) -> None:
         return
 
 
-def tracked_files(repo: Path, matching, limit: int = MAX_LISTED_FILES) -> list[str]:
+def tracked_files(repo: Path, matching: Callable[[str], bool], limit: int = MAX_LISTED_FILES) -> list[str]:
     """Tracked paths that `matching` accepts, streamed as git lists them.
 
     Args:
@@ -94,7 +99,9 @@ def tracked_files(repo: Path, matching, limit: int = MAX_LISTED_FILES) -> list[s
     return bounded_lines(repo, ["ls-files"], matching, limit)
 
 
-def bounded_lines(repo: Path, argv: list[str], matching, limit: int = MAX_LISTED_FILES) -> list[str]:
+def bounded_lines(
+    repo: Path, argv: list[str], matching: Callable[[str], bool], limit: int = MAX_LISTED_FILES
+) -> list[str]:
     """Lines one git command writes that `matching` accepts, read as it writes them.
 
     Streamed and capped rather than collected and sliced: a repository chooses how much a listing
@@ -111,8 +118,14 @@ def bounded_lines(repo: Path, argv: list[str], matching, limit: int = MAX_LISTED
         The accepted lines, in git's order.
     """
     limit = min(limit, MAX_LISTED_FILES)
-    listing = subprocess.Popen(["git", *argv], cwd=repo, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    listing = subprocess.Popen(
+        ["git", *argv],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
     group = os.getpgid(listing.pid)
     # The read itself has no deadline — a producer that stops mid-listing would block it forever —
     # so the deadline is put on the producer instead. When it fires the group goes, its pipe ends,
@@ -126,7 +139,7 @@ def bounded_lines(repo: Path, argv: list[str], matching, limit: int = MAX_LISTED
         # exactly the cap and then holds the pipe open would leave the reader waiting on a line it
         # had already decided not to use.
         while seen < limit:
-            line = (listing.stdout or "").readline()
+            line = listing.stdout.readline() if listing.stdout is not None else ""
             if not line:
                 break
             seen += 1
@@ -152,6 +165,10 @@ def _build_unit(repo: Path, path: str) -> tuple[str | None, str | None]:
     The package is the first manifest above the file that names one. The workspace root is the
     highest manifest that declares `[workspace]` and is not excluded by it, which is where that
     package's `cargo test` has to run from.
+
+    Returns:
+        The nearest package name and its enclosing workspace's relative root; either is `None`
+        when absent.
     """
     package: str | None = None
     directory = (repo / path).parent
@@ -185,6 +202,9 @@ def _is_member(manifest: str, repo: Path, workspace: Path, path: str) -> bool:
     than a verdict.
 
     A manifest with no `members` list is a single-package workspace, which owns what is beneath it.
+
+    Returns:
+        Whether the path falls within a declared member, or the manifest has no members list.
     """
     members = _MEMBERS_BLOCK.search(manifest)
     if members is None:
@@ -221,16 +241,32 @@ def repo_facts(
     Reads the forge's merged pull requests when it can, and falls back to first-parent git history
     when it cannot. The distinction matters: git history alone recognizes only squash merges, so on
     a repository that merges or rebases it offers almost nothing and says nothing about why.
+
+    Returns:
+        Repository metadata and merged-change facts, with the history source and any fallback
+        explanation.
     """
     try:
         return _facts_from_pull_requests(
-            repo, repo_name=repo_name, language=language, test_command=test_command,
-            branch=branch, limit=limit, language_contract=language_contract, setup_command=setup_command,
+            repo,
+            repo_name=repo_name,
+            language=language,
+            test_command=test_command,
+            branch=branch,
+            limit=limit,
+            language_contract=language_contract,
+            setup_command=setup_command,
         )
     except _ForgeUnavailable as failure:
         facts = _facts_from_git_log(
-            repo, repo_name=repo_name, language=language, test_command=test_command,
-            branch=branch, limit=limit, language_contract=language_contract, setup_command=setup_command,
+            repo,
+            repo_name=repo_name,
+            language=language,
+            test_command=test_command,
+            branch=branch,
+            limit=limit,
+            language_contract=language_contract,
+            setup_command=setup_command,
         )
         return replace(facts, source_note=str(failure)[:300])
 
@@ -239,11 +275,14 @@ class _ForgeUnavailable(RuntimeError):
     """The forge could not be asked — no `gh`, not authenticated, no remote, or it answered garbage."""
 
 
-def _merged_pulls(repo: Path, repo_name: str, branch: str, limit: int) -> list:
+def _merged_pulls(repo: Path, repo_name: str, branch: str, limit: int) -> list[dict[str, JSONAny]]:
     """Merged pull requests targeting `branch`, as the forge reports them.
 
     Raises:
         _ForgeUnavailable: If the forge could not answer, or answered with something unreadable.
+
+    Returns:
+        The forge's merged pull-request records for the requested base branch.
     """
     try:
         listing = subprocess.run(
@@ -251,15 +290,34 @@ def _merged_pulls(repo: Path, repo_name: str, branch: str, limit: int) -> list:
             # list is empty, but its git history holds every upstream merge commit — so a customer
             # mining a fork declares `repo = "upstream/name"` and the export still comes from the
             # local clone.
-            ["gh", "pr", "list", "-R", repo_name, "--state", "merged", "--base", branch,
-             "--limit", str(limit), "--json", _PR_FIELDS],
-            cwd=repo, capture_output=True, text=True, timeout=300, check=True,
+            [
+                "gh",
+                "pr",
+                "list",
+                "-R",
+                repo_name,
+                "--state",
+                "merged",
+                "--base",
+                branch,
+                "--limit",
+                str(limit),
+                "--json",
+                _PR_FIELDS,
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=True,
         ).stdout
         pulls = json.loads(listing)
     except subprocess.CalledProcessError as failure:
         # The forge's own words, not Python's: "exit status 1" tells a user nothing, the stderr
         # names the auth, the rate limit, or the field the query could not serve.
-        raise _ForgeUnavailable(f"gh pr list failed: {(failure.stderr or '').strip() or failure}") from failure
+        raise _ForgeUnavailable(
+            f"gh pr list failed: {(failure.stderr or '').strip() or failure}"
+        ) from failure
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as failure:
         raise _ForgeUnavailable(f"gh pr list: {failure}") from failure
     if not isinstance(pulls, list):
@@ -278,9 +336,24 @@ def _busiest_base(repo: Path, repo_name: str, limit: int) -> tuple[str, int]:
     """
     try:
         listing = subprocess.run(
-            ["gh", "pr", "list", "-R", repo_name, "--state", "merged", "--limit", str(limit),
-             "--json", "baseRefName"],
-            cwd=repo, capture_output=True, text=True, timeout=300, check=True,
+            [
+                "gh",
+                "pr",
+                "list",
+                "-R",
+                repo_name,
+                "--state",
+                "merged",
+                "--limit",
+                str(limit),
+                "--json",
+                "baseRefName",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=True,
         ).stdout
         bases = [entry.get("baseRefName") for entry in json.loads(listing)]
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError, AttributeError, TypeError):
@@ -293,10 +366,27 @@ def _busiest_base(repo: Path, repo_name: str, limit: int) -> tuple[str, int]:
     return counted.most_common(1)[0]
 
 
-def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
-    """The merged record as the forge sees it: one entry per pull request, whatever the strategy."""
+class _FactOptions(TypedDict):
+    """Repository identity, test contract, and history bounds shared by both collectors."""
+
+    repo_name: str
+    language: str
+    test_command: str
+    branch: str
+    limit: int
+    language_contract: Language | None
+    setup_command: str | None
+
+
+def _facts_from_pull_requests(repo: Path, **named: Unpack[_FactOptions]) -> RepoFacts:
+    """The merged record as the forge sees it: one entry per pull request, whatever the strategy.
+
+    Returns:
+        Repository facts from verified pull-request diffs, including counts of unresolved and
+        renamed changes.
+    """
     branch = str(named["branch"])
-    limit = int(named["limit"])  # type: ignore[call-overload]
+    limit = int(named["limit"])
     repo_name = str(named["repo_name"])
     pulls = _merged_pulls(repo, repo_name, branch, limit)
     note = ""
@@ -313,8 +403,10 @@ def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
         elsewhere, count = _busiest_base(repo, repo_name, limit)
         if elsewhere and elsewhere != branch:
             pulls = _merged_pulls(repo, repo_name, elsewhere, limit)
-            note = (f"no merged pull request targets the default branch {branch!r}; "
-                    f"{count} of the most recent target {elsewhere!r}, which is what was mined")
+            note = (
+                f"no merged pull request targets the default branch {branch!r}; "
+                f"{count} of the most recent target {elsewhere!r}, which is what was mined"
+            )
             branch = elsewhere
 
     changes: list[ChangeFacts] = []
@@ -327,7 +419,12 @@ def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
         if not merge or not paths:
             continue
         number = int(pull["number"])
-        unit = _resolve_unit(repo, merge, set(paths), lambda: _commit_count(repo, number, str(named["repo_name"])))
+        unit = _resolve_unit(
+            repo,
+            merge,
+            set(paths),
+            lambda: _commit_count(repo, number, str(named["repo_name"])),  # ruff:ignore[function-uses-loop-variable] - consumed before the next loop iteration
+        )
         if unit is None:
             unresolved += 1
             continue
@@ -342,23 +439,41 @@ def _facts_from_pull_requests(repo: Path, **named: object) -> RepoFacts:
         files = []
         for entry in pull["files"]:
             package, workspace_root = (None, None)
-            if contract is not None and contract.package_scoped:  # type: ignore[attr-defined]
+            if contract is not None and contract.package_scoped:
                 package, workspace_root = _build_unit(repo, entry["path"])
-            files.append(FileFacts(
-                path=entry["path"], insertions=int(entry.get("additions", 0)),
-                deletions=int(entry.get("deletions", 0)), package=package, workspace_root=workspace_root,
-            ))
-        changes.append(ChangeFacts(
-            change_id=reference, parent=parent, title=pull["title"], merged_at=pull["mergedAt"],
-            files=files, number=int(pull["number"]), labels=[l["name"] for l in pull.get("labels") or []],
-        ))
-        _PROSE_CACHE[(str(repo), reference)] = _pull_prose(pull)
+            files.append(
+                FileFacts(
+                    path=entry["path"],
+                    insertions=int(entry.get("additions", 0)),
+                    deletions=int(entry.get("deletions", 0)),
+                    package=package,
+                    workspace_root=workspace_root,
+                )
+            )
+        changes.append(
+            ChangeFacts(
+                change_id=reference,
+                parent=parent,
+                title=pull["title"],
+                merged_at=pull["mergedAt"],
+                files=files,
+                number=int(pull["number"]),
+                labels=[line["name"] for line in pull.get("labels") or []],
+            )
+        )
+        _PROSE_CACHE[str(repo), reference] = _pull_prose(pull)
     return RepoFacts(
-        repo=str(named["repo_name"]), forge="github", language=str(named["language"]),
-        test_command=str(named["test_command"]), changes=changes,
-        setup_command=named["setup_command"],  # type: ignore[arg-type]
-        source="github-prs", unresolved_changes=unresolved, renaming_changes=renaming,
-        source_note=note, protocol=PROTOCOL,
+        repo=str(named["repo_name"]),
+        forge="github",
+        language=str(named["language"]),
+        test_command=str(named["test_command"]),
+        changes=changes,
+        setup_command=named["setup_command"],
+        source="github-prs",
+        unresolved_changes=unresolved,
+        renaming_changes=renaming,
+        source_note=note,
+        protocol=PROTOCOL,
     )
 
 
@@ -378,6 +493,10 @@ def _resolve_unit(
     A candidate is accepted only when `git diff --name-only candidate merge` touches exactly the
     files the pull request says it touched. A parent that "looks right" but yields a subset of the
     PR — a rebase read as a squash — would produce a task missing most of its own change.
+
+    Returns:
+        The verified parent and merge commits, or `None` when the pull request cannot be
+        resolved safely.
     """
     try:
         parents = _git(repo, "rev-list", "--parents", "-n1", merge).split()[1:]
@@ -428,6 +547,10 @@ def _renames(repo: Path, parent: str, reference: str) -> list[tuple[str, str]]:
 
     Asked of git rather than of the forge: a pull request's file list names the destination only,
     so the source path is invisible to everything downstream of it.
+
+    Returns:
+        Source and destination paths for detected renames, or an empty list when the diff cannot
+        be read.
     """
     try:
         status = _git(repo, "diff", "--name-status", "-M", parent, reference)
@@ -442,7 +565,12 @@ def _renames(repo: Path, parent: str, reference: str) -> list[tuple[str, str]]:
 
 
 def _reaches_outside(repo: Path, candidate: str, merge: str, pr_paths: set[str]) -> bool:
-    """Whether the diff from `candidate` to `merge` touches any file the PR did not list."""
+    """Whether the diff from `candidate` to `merge` touches any file the PR did not list.
+
+    Returns:
+        Whether a readable diff touches any unlisted path; false when the candidate cannot be
+        resolved.
+    """
     try:
         resolved = _git(repo, "rev-parse", "--verify", f"{candidate}^{{commit}}").strip()
         touched = set(_git(repo, "diff", "--name-only", resolved, merge).split("\n")) - {""}
@@ -458,6 +586,10 @@ def _matches(
 
     With `allow_subset`, a non-empty diff touching only PR-listed files also passes. A diff touching
     a file the PR never listed never does: that is the signature of the wrong parent.
+
+    Returns:
+        The resolved candidate SHA when its changed paths satisfy the requested match, otherwise
+        `None`.
     """
     try:
         resolved = _git(repo, "rev-parse", "--verify", f"{candidate}^{{commit}}").strip()
@@ -472,25 +604,50 @@ def _matches(
 
 
 def _commit_count(repo: Path, number: int, repo_name: str) -> int | None:
-    """How many commits a pull request carried, or `None` when the forge will not say."""
+    """How many commits a pull request carried, or `None` when the forge will not say.
+
+    Returns:
+        The pull request's commit count, or `None` when the forge cannot provide it.
+    """
     try:
         out = subprocess.run(
-            ["gh", "pr", "view", str(number), "-R", repo_name, "--json", "commits", "--jq", ".commits|length"],
-            cwd=repo, capture_output=True, text=True, timeout=60, check=True,
+            [
+                "gh",
+                "pr",
+                "view",
+                str(number),
+                "-R",
+                repo_name,
+                "--json",
+                "commits",
+                "--jq",
+                ".commits|length",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
         ).stdout.strip()
         return int(out)
     except (subprocess.SubprocessError, OSError, ValueError):
         return None
 
 
-def _pull_prose(pull: dict) -> dict[str, str]:
+def _pull_prose(pull: dict[str, JSONAny]) -> dict[str, str]:
     """A change's title and body, and its linked issue's, each cut to what a prompt can use.
 
     Bounded because these are the forge's bytes, chosen by whoever opened the pull request, and they
     are held in `_PROSE_CACHE` for the whole of a mining run over every repository in it.
+
+    Returns:
+        Bounded change title and body, plus the first linked issue's title and body when
+        available.
     """
-    prose = {"change_title": _bounded_prose(pull.get("title")),
-             "change_body": _bounded_prose(pull.get("body"))}
+    prose = {
+        "change_title": _bounded_prose(pull.get("title")),
+        "change_body": _bounded_prose(pull.get("body")),
+    }
     linked = pull.get("closingIssuesReferences") or []
     if linked:
         prose["issue_title"] = _bounded_prose(linked[0].get("title"))
@@ -499,14 +656,22 @@ def _pull_prose(pull: dict) -> dict[str, str]:
 
 
 def _bounded_prose(value: object) -> str:
-    """One piece of prose about a change, cut to `_MAX_PROSE_CHARS`."""
+    """One piece of prose about a change, cut to `_MAX_PROSE_CHARS`.
+
+    Returns:
+        At most `_MAX_PROSE_CHARS` characters, with false values represented as empty text.
+    """
     return str(value or "")[:_MAX_PROSE_CHARS]
 
 
-def _facts_from_git_log(repo: Path, **named: object) -> RepoFacts:
-    """First-parent history: sees squash merges only. The fallback, and reported as such."""
+def _facts_from_git_log(repo: Path, **named: Unpack[_FactOptions]) -> RepoFacts:
+    """First-parent history: sees squash merges only. The fallback, and reported as such.
+
+    Returns:
+        Repository facts for readable single-parent changes, marked as a git-history fallback.
+    """
     branch = str(named["branch"])
-    limit = int(named["limit"])  # type: ignore[call-overload]
+    limit = int(named["limit"])
     contract = named["language_contract"]
     log = _git(repo, "log", "--first-parent", f"-n{limit}", "--format=%H%x00%P%x00%cI%x00%s", branch)
     changes: list[ChangeFacts] = []
@@ -532,25 +697,45 @@ def _facts_from_git_log(repo: Path, **named: object) -> RepoFacts:
             if insertions == "-" or deletions == "-":
                 continue  # binary
             package, workspace_root = (None, None)
-            if contract is not None and contract.package_scoped:  # type: ignore[attr-defined]
+            if contract is not None and contract.package_scoped:
                 package, workspace_root = _build_unit(repo, path)
-            files.append(FileFacts(path=path, insertions=int(insertions), deletions=int(deletions),
-                                   package=package, workspace_root=workspace_root))
+            files.append(
+                FileFacts(
+                    path=path,
+                    insertions=int(insertions),
+                    deletions=int(deletions),
+                    package=package,
+                    workspace_root=workspace_root,
+                )
+            )
         if files:
-            changes.append(ChangeFacts(change_id=change_id, parent=parent_list[0], title=title,
-                                       merged_at=merged_at, files=files))
+            changes.append(
+                ChangeFacts(
+                    change_id=change_id, parent=parent_list[0], title=title, merged_at=merged_at, files=files
+                )
+            )
     return RepoFacts(
-        repo=str(named["repo_name"]), forge="github", language=str(named["language"]),
-        test_command=str(named["test_command"]), changes=changes,
-        setup_command=named["setup_command"],  # type: ignore[arg-type]
-        source="git-log", unreadable_changes=unreadable, protocol=PROTOCOL,
+        repo=str(named["repo_name"]),
+        forge="github",
+        language=str(named["language"]),
+        test_command=str(named["test_command"]),
+        changes=changes,
+        setup_command=named["setup_command"],
+        source="git-log",
+        unreadable_changes=unreadable,
+        protocol=PROTOCOL,
     )
 
 
 def bounded_text(path: Path) -> str | None:
     """A working-tree file's text, or `None` when it is absent, unreadable, or larger than a file
     worth reading. The size is checked before the read, so one enormous file in a repository cannot
-    be the whole of what a caller holds in memory."""
+    be the whole of what a caller holds in memory.
+
+    Returns:
+        The file's decoded text, or `None` for missing, unreadable, non-file, or oversized
+        paths.
+    """
     try:
         if not path.is_file() or path.stat().st_size > _MAX_FILE_BYTES:
             return None
@@ -560,7 +745,12 @@ def bounded_text(path: Path) -> str | None:
 
 
 def _blob(repo: Path, commit: str, path: str) -> str | None:
-    """Return a file's content at `commit`, or `None` when absent or too large to send."""
+    """Return a file's content at `commit`, or `None` when absent or too large to send.
+
+    Returns:
+        The file content at the commit, or `None` when the object is absent or exceeds the size
+        cap.
+    """
     try:
         size = _git(repo, "cat-file", "-s", f"{commit}:{path}").strip()
     except subprocess.CalledProcessError:
@@ -576,6 +766,10 @@ def _prose(repo: Path, change_id: str) -> dict[str, str]:
     The commit subject and body are always available. The linked issue is fetched through the forge
     when its CLI is authenticated, and quietly skipped when it is not — a task whose prompt is
     thinner is worse, but an unauthenticated runner should still produce one.
+
+    Returns:
+        Bounded change title and body, with linked-issue prose when available from the cache or
+        forge.
     """
     cached = _PROSE_CACHE.get((str(repo), change_id))
     if cached is not None:
@@ -589,9 +783,14 @@ def _prose(repo: Path, change_id: str) -> dict[str, str]:
     try:
         linked = subprocess.run(
             [
-                "gh", "pr", "view", number.group(1),
-                "--json", "closingIssuesReferences",
-                "--jq", ".closingIssuesReferences[0] | [.title, .body] | @tsv",
+                "gh",
+                "pr",
+                "view",
+                number.group(1),
+                "--json",
+                "closingIssuesReferences",
+                "--jq",
+                ".closingIssuesReferences[0] | [.title, .body] | @tsv",
             ],
             cwd=repo,
             check=True,
@@ -608,7 +807,9 @@ def _prose(repo: Path, change_id: str) -> dict[str, str]:
     return prose
 
 
-def change_source(repo: Path, facts: RepoFacts, change_ids: list[str], language: Language) -> list[ChangeSource]:
+def change_source(
+    repo: Path, facts: RepoFacts, change_ids: list[str], language: Language
+) -> list[ChangeSource]:
     """Send both sides of every file the named changes touched that the splitter will look at, plus
     their human prose.
 
@@ -650,11 +851,33 @@ def change_source(repo: Path, facts: RepoFacts, change_ids: list[str], language:
 # --- conventions: what the repository says about how code should look ---------------------------
 
 _CONVENTION_FILES = (
-    "CONTRIBUTING.md", ".github/CONTRIBUTING.md", ".github/PULL_REQUEST_TEMPLATE.md", "PULL_REQUEST_TEMPLATE.md",
-    "AGENTS.md", "CLAUDE.md", ".editorconfig",
-    ".golangci.yml", ".golangci.yaml", "rustfmt.toml", ".rustfmt.toml", "clippy.toml", "ruff.toml", ".ruff.toml",
-    "setup.cfg", ".flake8", ".eslintrc.json", ".eslintrc.js", "eslint.config.js", ".prettierrc", "biome.json",
-    ".swiftlint.yml", "detekt.yml", ".scalafmt.conf", "analysis_options.yaml", ".rubocop.yml", "phpcs.xml",
+    "CONTRIBUTING.md",
+    ".github/CONTRIBUTING.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    "PULL_REQUEST_TEMPLATE.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".editorconfig",
+    ".golangci.yml",
+    ".golangci.yaml",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "clippy.toml",
+    "ruff.toml",
+    ".ruff.toml",
+    "setup.cfg",
+    ".flake8",
+    ".eslintrc.json",
+    ".eslintrc.js",
+    "eslint.config.js",
+    ".prettierrc",
+    "biome.json",
+    ".swiftlint.yml",
+    "detekt.yml",
+    ".scalafmt.conf",
+    "analysis_options.yaml",
+    ".rubocop.yml",
+    "phpcs.xml",
 )
 _CONVENTION_FILE_CAP = 24_000
 """Bytes per file. Enough for any contributing guide; a 70 KB user manual is not a convention."""
@@ -663,7 +886,11 @@ _COMMENT_CAP = 400
 
 def convention_files(repo: Path) -> dict[str, str]:
     """The repository's written rules, by path: contributing guide, PR template, agent instructions,
-    lint and format configuration. Only files that exist and are not enormous."""
+    lint and format configuration. Only files that exist and are not enormous.
+
+    Returns:
+        Recognized convention-file paths mapped to their readable, size-bounded contents.
+    """
     found: dict[str, str] = {}
     for name in _CONVENTION_FILES:
         text = _read_without_following(repo / name)
@@ -679,6 +906,10 @@ def _read_without_following(path: Path) -> str | None:
     the repository being mined — `AGENTS.md` can be a symlink to `/etc/hostname`, or to anything
     else the CI user can read, and the text is sent to the service to become the rubric. `O_NOFOLLOW`
     refuses the link rather than reading through it.
+
+    Returns:
+        The UTF-8 text, or `None` for a symlink, oversized file, read failure, or invalid
+        encoding.
     """
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -697,8 +928,11 @@ def _read_without_following(path: Path) -> str | None:
             os.close(descriptor)
 
 
-def review_comments(repo: Path, repo_name: str, numbers: list[int], limit: int = 400) -> list[dict]:
-    """Inline review comments the repository's own maintainers left on merged pull requests — the conventions of this
+def review_comments(
+    repo: Path, repo_name: str, numbers: list[int], limit: int = 400
+) -> list[dict[str, JSONAny]]:
+    """Inline review comments the repository's own maintainers left on merged pull requests — the
+    conventions of this
     repository stated where they mattered.
 
     Filtered to `OWNER`, `MEMBER` and `COLLABORATOR`, not merely to accounts of type `User`: a pull
@@ -707,17 +941,31 @@ def review_comments(repo: Path, repo_name: str, numbers: list[int], limit: int =
     read by a model — anyone able to comment on a public pull request could otherwise write text
     intended to steer the rubric. Bots are dropped as well (generic, and they dwarf the humans), as
     are acknowledgements too short to carry a rule.
+
+    Returns:
+        Up to `limit` substantive human maintainer comments with pull number, path, author, and
+        bounded body.
     """
-    collected: list[dict] = []
+    collected: list[dict[str, JSONAny]] = []
     for number in numbers:
         try:
             out = subprocess.run(
-                ["gh", "api", f"repos/{repo_name}/pulls/{number}/comments", "--paginate",
-                 "--jq", '.[] | select(.user.type == "User") '
-                         '| select(.author_association == "OWNER" or .author_association == "MEMBER" '
-                         'or .author_association == "COLLABORATOR") '
-                         '| {path, body, author: .user.login} | @json'],
-                cwd=repo, capture_output=True, text=True, timeout=60, check=True,
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo_name}/pulls/{number}/comments",
+                    "--paginate",
+                    "--jq",
+                    '.[] | select(.user.type == "User") '
+                    '| select(.author_association == "OWNER" or .author_association == "MEMBER" '
+                    'or .author_association == "COLLABORATOR") '
+                    "| {path, body, author: .user.login} | @json",
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=True,
             ).stdout
         except (subprocess.SubprocessError, OSError):
             continue
@@ -728,8 +976,14 @@ def review_comments(repo: Path, repo_name: str, numbers: list[int], limit: int =
             body = " ".join((comment.get("body") or "").split())
             if len(body) < 40 or body.lower().startswith(("done", "thanks", "thank you", "ok", "lgtm", "@")):
                 continue
-            collected.append({"number": number, "path": comment.get("path") or "", "author": comment["author"],
-                              "body": body[:_COMMENT_CAP]})
+            collected.append(
+                {
+                    "number": number,
+                    "path": comment.get("path") or "",
+                    "author": comment["author"],
+                    "body": body[:_COMMENT_CAP],
+                }
+            )
             if len(collected) >= limit:
                 return collected
     return collected

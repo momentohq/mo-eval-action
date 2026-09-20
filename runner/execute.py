@@ -20,16 +20,17 @@ import signal
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO, cast
 
 from wire import OrderResult, Step, StepResult, WorkOrder
 
 _RUNNER_CREDENTIALS = (
-    "MO_EVAL_TOKEN",                  # the bearer this runner authenticates to the service with
-    "GH_TOKEN",                       # set by the Action so the forge can be queried
+    "MO_EVAL_TOKEN",  # the bearer this runner authenticates to the service with
+    "GH_TOKEN",  # set by the Action so the forge can be queried
     "GITHUB_TOKEN",
-    "ACTIONS_ID_TOKEN_REQUEST_URL",   # together, these MINT an identity for the repository
+    "ACTIONS_ID_TOKEN_REQUEST_URL",  # together, these MINT an identity for the repository
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
 )
 """What the runner itself brings into the job, and must take away again before running a test.
@@ -48,12 +49,18 @@ holds only in memory reads as a boundary and is not one.
 """
 
 
-def _without_the_runners_credentials(inherited: Mapping[str, str], declared: dict[str, str]) -> dict[str, str]:
+def _without_the_runners_credentials(
+    inherited: Mapping[str, str], declared: dict[str, str]
+) -> dict[str, str]:
     """The environment a repository's own test command is run with.
 
     The declared half is filtered too. `forward_env` names variables to carry over from the runner's
     own environment, so a repository that named one of these would otherwise hand itself the
     credential the inherited half just removed.
+
+    Returns:
+        Inherited and declared environment values with runner credentials removed and color
+        disabled.
     """
     return {
         **_UNCOLOURED,
@@ -149,7 +156,7 @@ for being longer than an arbitrary window. Only reached on the over-long path; a
 carried whole and needs no overlap."""
 
 
-def _scanned(sink, *patterns: str | None) -> tuple[bool | None, ...]:
+def _scanned(sink: BinaryIO, *patterns: str | None) -> tuple[bool | None, ...]:
     """Whether `pattern` occurs anywhere in the spooled output.
 
     Read a piece at a time, because the whole of a command's output is up to the spool cap and the
@@ -166,6 +173,10 @@ def _scanned(sink, *patterns: str | None) -> tuple[bool | None, ...]:
     Leaves the position where it stopped, so a caller that still wants the tail records the end
     first. A pattern that does not compile is the service's mistake, not this runner's, and is
     reported as "not looked for" rather than ending the order.
+
+    Returns:
+        One match status per pattern: `None` when absent, false when invalid or unmatched, and
+        true when found.
     """
     compiled: list[re.Pattern[str] | None] = []
     for pattern in patterns:
@@ -188,6 +199,7 @@ def _scanned(sink, *patterns: str | None) -> tuple[bool | None, ...]:
     while True:
         chunk = sink.read(_SCAN_CHUNK_BYTES)
         text = carry + decoder.decode(chunk, final=not chunk)
+
         def look(where: str, whole: bool) -> None:
             """Record every pattern that matches `where`. `whole` says the edges of the string are
             edges the output really has, so a match touching one is genuine."""
@@ -195,7 +207,7 @@ def _scanned(sink, *patterns: str | None) -> tuple[bool | None, ...]:
                 if expression is None or found[index]:
                     continue
                 match = expression.search(where)
-                if match is not None and (whole or 0 < match.start() and match.end() < len(where)):
+                if match is not None and (whole or (match.start() > 0 and match.end() < len(where))):
                     found[index] = True
 
         if not chunk:
@@ -220,23 +232,37 @@ def _scanned(sink, *patterns: str | None) -> tuple[bool | None, ...]:
             carry = text
 
 
-def _bounded_output(argv: list[str], *, cwd, env: dict[str, str] | None, timeout: float,
-                    proof: str | None = None,
-                    counterproof: str | None = None) -> tuple[int, str, bool | None, bool | None]:
+def _bounded_output(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None,
+    timeout: float,
+    proof: str | None = None,
+    counterproof: str | None = None,
+) -> tuple[int, str, bool | None, bool | None]:
     """Run a command and return its exit code and the tail of what it wrote.
 
     The output is written to a temporary file and only the tail is read back. `capture_output`
     would hold all of it in this process first, so the tail would be a display limit and not a
     bound: a repository whose setup prints for half an hour has a CI runner's memory to fill
     before the timeout ever arrives.
+
+    Returns:
+        The exit code, decoded output tail, and match statuses for the proof and counterproof
+        patterns.
+
+    Raises:
+        OrderError: If the command exceeds the output spool cap.
     """
     with tempfile.TemporaryFile("w+b") as sink:
         # Its own process group, so the deadline takes the tree and not just its root. The command
         # is the repository's own — `cargo test`, `pytest`, `make` — and each of those is a parent
         # of compilers, test binaries and servers. Killing the root leaves those running on the CI
         # runner after the workspace they were using has already been deleted.
-        child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=sink, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
+        child = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdout=sink, stderr=subprocess.STDOUT, start_new_session=True
+        )
         group = os.getpgid(child.pid)
         try:
             _wait_within(child, sink, timeout)
@@ -268,7 +294,7 @@ def _bounded_output(argv: list[str], *, cwd, env: dict[str, str] | None, timeout
         return child.returncode, sink.read().decode(errors="replace"), seen, failed
 
 
-def _wait_within(child: subprocess.Popen, sink, timeout: float) -> None:
+def _wait_within(child: subprocess.Popen[bytes], sink: BinaryIO, timeout: float) -> None:
     """Wait for a child, ending it if it runs too long or writes more than the runner will hold.
 
     The tail is what gets reported; it is not backpressure. A command writing at device speed for
@@ -297,15 +323,20 @@ def _wait_within(child: subprocess.Popen, sink, timeout: float) -> None:
         time.sleep(min(_EXIT_POLL_SECONDS, remaining))
 
 
-def _exited(child: subprocess.Popen) -> bool:
+def _exited(child: subprocess.Popen[bytes]) -> bool:
     """Whether the child has finished, WITHOUT reaping it.
 
     `wait` would reap, and a reaped pid is free to be reused — including as the id of somebody
     else's process group, which is the thing the caller goes on to kill. Left as a zombie the pid
     stays reserved until the caller has finished with it.
+
+    Returns:
+        Whether the child has exited or has already been reaped.
     """
     try:
-        return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+        # Some platform stubs omit waitid although the runner's supported Python provides it.
+        waitid = cast(Callable[[int, int, int], object | None], getattr(os, "waitid"))  # ruff:ignore[get-attr-with-constant] - platform-specific typeshed availability
+        return waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
     except ChildProcessError:
         return True
 
@@ -344,7 +375,11 @@ def _end_group(group: int) -> None:
 
 
 def _group_alive(group: int) -> bool:
-    """Whether any process in the group is still there."""
+    """Whether any process in the group is still there.
+
+    Returns:
+        Whether the process group exists and the caller has permission to signal it.
+    """
     try:
         os.killpg(group, 0)
     except (ProcessLookupError, PermissionError):
@@ -363,6 +398,12 @@ def commit_or_refuse(value: str) -> str:
     option instead: `--output=<path>` truncates that path before git notices the tree is missing,
     and `--remote=<url>` opens a connection out of the customer's CI. Every value the service names
     goes through here, so nothing but a hexadecimal object name ever reaches git.
+
+    Returns:
+        The unchanged hexadecimal commit name after validation.
+
+    Raises:
+        OrderError: If the value is not an accepted hexadecimal commit name.
     """
     if not _COMMIT.fullmatch(value):
         raise OrderError(f"the service named {value!r} as a commit, which is not one")
@@ -375,9 +416,16 @@ def _host_target() -> str:
     Environment knowledge, so the runner answers it. A repository whose test command needs the triple
     writes `{host_target}` in its declared command and the runner fills it in; the service never
     supplies it, because the service does not know what machine this is.
+
+    Returns:
+        The host target triple reported by the installed Rust compiler.
+
+    Raises:
+        OrderError: If the Rust compiler reports no host target triple.
     """
-    probe = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True,
-                           timeout=_LOCAL_COMMAND_SECONDS)
+    probe = subprocess.run(
+        ["rustc", "-vV"], check=True, capture_output=True, text=True, timeout=_LOCAL_COMMAND_SECONDS
+    )
     for line in probe.stdout.splitlines():
         if line.startswith("host: "):
             return line.removeprefix("host: ").strip()
@@ -392,6 +440,10 @@ def _fills(part: str, argument: str) -> bool:
     called begins with `-`, and that is the character that turns a selector into an instruction.
     There is no shell here, so what an argument contains reaches the tool as one argument; what
     matters is whether the tool will read it as a flag.
+
+    Returns:
+        Whether only supported placeholders changed, with option-like values and unsafe package
+        paths rejected.
     """
     if "{" not in part:
         return argument == part
@@ -411,7 +463,12 @@ def _fills(part: str, argument: str) -> bool:
 
 
 def _within_the_tree(argument: str) -> bool:
-    """Whether a path argument stays inside the exported tree and names a path rather than a flag."""
+    """Whether a path argument stays inside the exported tree and names a path rather than a flag.
+
+    Returns:
+        Whether the argument avoids traversal, absolute paths, home expansion, and option or
+        response-file prefixes.
+    """
     if argument.startswith(("-", "@", "/", "~")):
         return False
     return not any(segment == ".." for segment in PurePosixPath(argument).parts)
@@ -423,6 +480,9 @@ def _expand(command: str) -> list[str]:
     `_host_target` shells out to `rustc`, so it is resolved only when a part actually carries the
     placeholder. Resolving it unconditionally would make every Go or Python probe depend on a Rust
     toolchain being installed.
+
+    Returns:
+        Shell-split command arguments with any host-target placeholders filled.
     """
     parts = shlex.split(command)
     if not any("{host_target}" in part for part in parts):
@@ -470,8 +530,9 @@ class Runner:
         # the wrong test: `forward_env` is the secret-bearing half of the declaration, so a short
         # value there is a short credential, while a long one in `env` is a long build flag.
         # Longest first, so a value that contains another is replaced before its substring is.
-        self._secrets = tuple(sorted(
-            {env[name] for name in (secret_names or ()) if env.get(name)}, key=len, reverse=True))
+        self._secrets = tuple(
+            sorted({env[name] for name in (secret_names or ()) if env.get(name)}, key=len, reverse=True)
+        )
         self._runner_deadline = time.monotonic() + _MAX_RUNNER_SECONDS
         self._deadline = self._runner_deadline
 
@@ -491,8 +552,11 @@ class Runner:
             # The runner's own bound on what one order may cost its CI. Each probe may run for an
             # hour, so the number of them is the number that matters, and the service composing
             # them is the party this runner does not assume is well behaved.
-            return OrderResult(order_id=order.order_id, steps=[],
-                               error=f"order carries {len(order.steps)} steps; at most {_MAX_STEPS_PER_ORDER}")
+            return OrderResult(
+                order_id=order.order_id,
+                steps=[],
+                error=f"order carries {len(order.steps)} steps; at most {_MAX_STEPS_PER_ORDER}",
+            )
         workspace = self.workspaces / order.order_id
         results: list[StepResult] = []
         self._deadline = min(time.monotonic() + _MAX_ORDER_SECONDS, self._runner_deadline)
@@ -505,18 +569,19 @@ class Runner:
             if time.monotonic() >= self._deadline:
                 # The step was cut short because the order's budget ran out, not because the step
                 # itself was slow. Reporting its truncated deadline would name the wrong bound.
-                return OrderResult(order_id=order.order_id, steps=results,
-                                   error="the order ran out of time")
-            return OrderResult(order_id=order.order_id, steps=results,
-                               error=f"a step timed out after {failure.timeout:.0f}s")
+                return OrderResult(order_id=order.order_id, steps=results, error="the order ran out of time")
+            return OrderResult(
+                order_id=order.order_id, steps=results, error=f"a step timed out after {failure.timeout:.0f}s"
+            )
         except OrderError as failure:
             return OrderResult(order_id=order.order_id, steps=results, error=str(failure))
         except OSError as failure:
             # A setup or test command naming an executable this runner does not have. `run` promises
             # an `OrderResult` carrying `error`; without this the caller gets a traceback and the
             # whole suite stops on one repository's misdeclared command.
-            return OrderResult(order_id=order.order_id, steps=results,
-                               error=f"a step could not be started: {failure}")
+            return OrderResult(
+                order_id=order.order_id, steps=results, error=f"a step could not be started: {failure}"
+            )
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
         return OrderResult(order_id=order.order_id, steps=results)
@@ -526,6 +591,9 @@ class Runner:
 
         Raises:
             OrderError: If neither budget has any time left.
+
+        Returns:
+            The allowed step duration in seconds, capped by the remaining order budget.
         """
         remaining = self._deadline - time.monotonic()
         if remaining <= 0:
@@ -551,14 +619,22 @@ class Runner:
         A tree export, not a clone: the workspace gets no history and no remote, so nothing in it can
         be used to look up how the change was actually made. mo-eval's own t-suite materializer takes
         the same approach, for the same reason.
+
+        Raises:
+            OrderError: If the export step carries no commit or names an invalid commit, or the
+                order budget is exhausted.
         """
         if step.commit is None:
             raise OrderError("export step carries no commit")
         if workspace.exists():
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True)
-        _export_into(self.repo, commit_or_refuse(step.commit),
-                     workspace, self._within_deadline(_EXPORT_TIMEOUT_SECONDS))
+        _export_into(
+            self.repo,
+            commit_or_refuse(step.commit),
+            workspace,
+            self._within_deadline(_EXPORT_TIMEOUT_SECONDS),
+        )
         _freshen(workspace)
         _own_repository(workspace, self._within_deadline(_LOCAL_COMMAND_SECONDS))
 
@@ -568,12 +644,18 @@ class Runner:
         The step carries no command and cannot: the service asks for setup and the runner decides
         what that means. A repository that declares none is assumed to build from its source, which
         is true of every compiled language here and of none of the interpreted ones.
+
+        Returns:
+            The setup step's exit status, elapsed time, and redacted output, or a successful no-
+            setup record.
         """
         if self.setup_command is None:
             return self._result(step, 0, started, "no setup command declared")
         exit_code, tail, _, _ = _bounded_output(
-            shlex.split(self.setup_command), cwd=workspace,
-            env=self._test_environment, timeout=self._within_deadline(_SETUP_TIMEOUT_SECONDS),
+            shlex.split(self.setup_command),
+            cwd=workspace,
+            env=self._test_environment,
+            timeout=self._within_deadline(_SETUP_TIMEOUT_SECONDS),
         )
         return self._result(step, exit_code, started, tail)
 
@@ -603,7 +685,17 @@ class Runner:
         return self._result(step, completed.returncode, started, tail)
 
     def _probe(self, step: Step, workspace: Path, started: float) -> StepResult:
-        """Run the repository's declared test command with the service's arguments appended."""
+        """Run the repository's declared test command with the service's arguments appended.
+
+        Returns:
+            The probe's exit status, elapsed time, redacted output, and proof statuses; a step
+            timeout uses exit code 124.
+
+        Raises:
+            OrderError: If probe arguments are absent or invalid, the working directory is
+                unsafe, or the order budget is exhausted.
+            TimeoutExpired: If the probe times out after the overall order deadline is reached.
+        """
         if step.args is None:
             raise OrderError("probe step carries no args")
         arguments = self._filter_or_refuse(step.args)
@@ -615,8 +707,12 @@ class Runner:
         command = [*_expand(self.test_command), *arguments]
         try:
             exit_code, tail, seen, failed = _bounded_output(
-                command, cwd=directory, env=self._test_environment, timeout=budget,
-                proof=step.proof, counterproof=step.counterproof,
+                command,
+                cwd=directory,
+                env=self._test_environment,
+                timeout=budget,
+                proof=step.proof,
+                counterproof=step.counterproof,
             )
         except subprocess.TimeoutExpired:
             if time.monotonic() >= self._deadline:
@@ -627,9 +723,14 @@ class Runner:
             # A probe that did not finish proves nothing, and says so rather than leaving the
             # service to read a timeout's exit code as a test that failed. Reported only where a
             # pattern was carried, so a runner asked nothing still answers nothing.
-            return self._result(step, 124, started, "probe timed out",
-                                proof_seen=False if step.proof else None,
-                                counterproof_seen=False if step.counterproof else None)
+            return self._result(
+                step,
+                124,
+                started,
+                "probe timed out",
+                proof_seen=False if step.proof else None,
+                counterproof_seen=False if step.counterproof else None,
+            )
         return self._result(step, exit_code, started, tail, seen, failed)
 
     def _filter_or_refuse(self, arguments: list[str]) -> list[str]:
@@ -645,17 +746,21 @@ class Runner:
 
         Raises:
             OrderError: If the arguments are not ones this contract's filter could have produced.
+
+        Returns:
+            The unchanged arguments after validation against the language's test-filter
+            template.
         """
         expected = shlex.split(self.filter_template)
         scope = 2 if arguments[:1] == ["-p"] and len(arguments) == len(expected) + 2 else 0
-        if scope:
-            # Cargo's `-p <package>`, which the service prepends to the template's own arguments.
-            if arguments[1].startswith("-"):
-                raise OrderError(f"probe argument {arguments[1]!r} is not a package")
+        # Cargo's `-p <package>`, which the service prepends to the template's own arguments.
+        if scope and arguments[1].startswith("-"):
+            raise OrderError(f"probe argument {arguments[1]!r} is not a package")
         if len(arguments) - scope != len(expected):
             raise OrderError(
-                f"probe carries {len(arguments)} argument(s); this language's filter takes {len(expected)}")
-        for argument, part in zip(arguments[scope:], expected):
+                f"probe carries {len(arguments)} argument(s); this language's filter takes {len(expected)}"
+            )
+        for argument, part in zip(arguments[scope:], expected, strict=True):
             if not _fills(part, argument):
                 raise OrderError(f"probe argument {argument!r} is not {part!r} filled in")
         return arguments
@@ -669,6 +774,9 @@ class Runner:
 
         Raises:
             OrderError: If the path escapes the workspace or does not exist.
+
+        Returns:
+            The workspace itself or an existing directory resolved within it.
         """
         if relative is None or relative == ".":
             return workspace
@@ -679,8 +787,15 @@ class Runner:
             raise OrderError(f"probe directory does not exist: {relative!r}")
         return resolved
 
-    def _result(self, step: Step, exit_code: int, started: float, tail: str,
-                proof_seen: bool | None = None, counterproof_seen: bool | None = None) -> StepResult:
+    def _result(
+        self,
+        step: Step,
+        exit_code: int,
+        started: float,
+        tail: str,
+        proof_seen: bool | None = None,
+        counterproof_seen: bool | None = None,
+    ) -> StepResult:
         return StepResult(
             step_id=step.step_id,
             exit_code=exit_code,
@@ -695,6 +810,9 @@ class Runner:
 
         Redacted first and cut afterwards. Cutting first leaves whatever half of a value fell
         inside the window, and a credential with a known prefix is mostly its second half.
+
+        Returns:
+            The bounded output tail after replacing forwarded secret values.
         """
         return self._redacted(output)[-_OUTPUT_TAIL_BYTES:]
 
@@ -706,6 +824,10 @@ class Runner:
         crosses back to the service, and a failing test that prints its environment, a stack trace
         that renders a client object, or a verbose HTTP log would carry the value with it. Every
         tail goes through here, so there is one place that has to be right rather than one per step.
+
+        Returns:
+            The supplied output with every forwarded secret value replaced by the redaction
+            marker.
         """
         for secret in self._secrets:
             tail = tail.replace(secret, _REDACTED)
@@ -723,12 +845,21 @@ def _export_into(repo: Path, commit: str, workspace: Path, timeout: float) -> No
         OrderError: If either side fails, or the producer does not finish.
         subprocess.TimeoutExpired: If the extraction does not finish.
     """
-    archive = subprocess.Popen(["git", "archive", "--format=tar", "--", commit], cwd=repo,
-                               stdout=subprocess.PIPE, start_new_session=True)
+    archive = subprocess.Popen(
+        ["git", "archive", "--format=tar", "--", commit],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
     group = os.getpgid(archive.pid)
     try:
-        extract = subprocess.run(["tar", "-xf", "-", "-C", str(workspace)], stdin=archive.stdout,
-                                 capture_output=True, text=True, timeout=timeout)
+        extract = subprocess.run(
+            ["tar", "-xf", "-", "-C", str(workspace)],
+            stdin=archive.stdout,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
     finally:
         if archive.stdout is not None:
             archive.stdout.close()
@@ -755,8 +886,7 @@ def _own_repository(workspace: Path, timeout: float = _LOCAL_COMMAND_SECONDS) ->
     start state, which the judge read as "already passes". An empty repository in the workspace
     stops discovery at the workspace boundary.
     """
-    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True, capture_output=True,
-                   timeout=timeout)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True, capture_output=True, timeout=timeout)
 
 
 def _freshen(workspace: Path) -> None:

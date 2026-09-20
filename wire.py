@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from types import NoneType, UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
@@ -592,6 +592,9 @@ def event_cost(text: str) -> int:
 
     In characters, which here is in bytes: `json.dumps` escapes non-ASCII too, so nothing it
     produced encodes to more than one.
+
+    Returns:
+        The bytes added by the text inside a JSON string, excluding the enclosing quotes.
     """
     return len(json.dumps(text)) - 2
 
@@ -647,7 +650,11 @@ class _Budget:
 
 
 def _bounded(count: int, kind: object) -> None:
-    """Refuse a collection larger than one message may carry."""
+    """Refuse a collection larger than one message may carry.
+
+    Raises:
+        ValueError: If the count exceeds the per-collection entry limit.
+    """
     if count > MAX_COLLECTION_ENTRIES:
         raise ValueError(f"{count} entries for {kind}; at most {MAX_COLLECTION_ENTRIES}")
 
@@ -658,6 +665,12 @@ def _bounded_text(value: str, kind: object) -> str:
     A separate axis from the count. One entry holding a multi-gigabyte string is a message the
     count bound never sees — and several fields here carry whole files, whole patches and whole
     task packages, so a generous ceiling is still a ceiling.
+
+    Returns:
+        The unchanged string after enforcing the per-field character limit.
+
+    Raises:
+        ValueError: If the string exceeds the per-field character limit.
     """
     if len(value) > MAX_STRING_CHARS:
         raise ValueError(f"{len(value)} characters for {kind}; at most {MAX_STRING_CHARS}")
@@ -678,6 +691,9 @@ def from_json(kind: type, data: Any, _budget: _Budget | None = None) -> Any:
     Raises:
         ValueError: If `data` does not fit `kind`, or the whole of it decodes to more than one
             message may carry.
+
+    Returns:
+        The decoded boundary value after validating its shape and message-size limits.
     """
     budget = _budget if _budget is not None else _Budget(MAX_DECODED_ENTRIES)
     origin = get_origin(kind)
@@ -770,7 +786,12 @@ class Wire:
         return payload
 
     def manifest(self) -> str:
-        """Render the recorded crossings as a table, newest last."""
+        """Render the recorded crossings as a table, newest last.
+
+        Returns:
+            A newline-separated table of recorded crossing directions, names, and byte sizes,
+            newest last.
+        """
         rows = []
         for path in sorted(itertools.islice(self.root.glob("*.json"), MAX_CROSSINGS)):
             _, direction, name = path.stem.split("-", 2)
@@ -789,6 +810,10 @@ def to_json(value: Any) -> Any:
     Left out at all because `from_json` refuses a key it does not know, so every field this side
     adds is otherwise a key the other side has never heard of — and the other side here is a GitHub
     Action, published and pinned by version, running in a customer's CI.
+
+    Returns:
+        JSON-compatible values with dataclasses expanded and optional fields at their `None`
+        default omitted.
     """
     if is_dataclass(value) and not isinstance(value, type):
         # Field by field rather than `asdict`, which converts the whole tree in one go: it would
@@ -796,9 +821,11 @@ def to_json(value: Any) -> Any:
         # omission below would then apply only to the outermost object. Production sends nested
         # ones — a `WorkOrder` of `Step`s, an `OrderResult` of `StepResult`s — so an `asdict` here
         # leaves every new field in every nested object on the wire as a null.
-        return {field.name: to_json(getattr(value, field.name))
-                for field in fields(value)
-                if getattr(value, field.name) is not None or field.default is not None}
+        return {
+            field.name: to_json(getattr(value, field.name))
+            for field in fields(value)
+            if getattr(value, field.name) is not None or field.default is not None
+        }
     if isinstance(value, list):
         return [to_json(item) for item in value]
     if isinstance(value, dict):

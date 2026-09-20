@@ -240,7 +240,7 @@ class Language:
     the toolchain, not the code under test."""
 
 
-def is_source_path(path: str, language: "Language") -> bool:
+def is_source_path(path: str, language: Language) -> bool:
     """Whether a changed file is one the splitter will look at.
 
     The runner asks this before it reads a blob, and the service asks it again before it diffs one.
@@ -249,11 +249,14 @@ def is_source_path(path: str, language: "Language") -> bool:
     ship a customer's files to a service that discards them unread.
 
     Path and contract only — no content — so the runner can apply it to the facts it already holds.
+
+    Returns:
+        Whether the path matches a source suffix or test path in the language contract.
     """
     return path.endswith(language.source_suffixes) or bool(language.test_path.search(path))
 
 
-def offline_test(test_command: str, language: "Language") -> str:
+def offline_test(test_command: str, language: Language) -> str:
     """A test command as a worker must run it: told to resolve from the tree, not from a network.
 
     The same contract-supplied telling `offline_setup` gives a setup command, for a toolchain that
@@ -266,13 +269,16 @@ def offline_test(test_command: str, language: "Language") -> str:
     task an agent cannot work on.
 
     Empty for a contract that needs no telling, which is every one but Rust today.
+
+    Returns:
+        The test command with offline arguments appended when the contract requires them.
     """
     if not language.offline_test_args:
         return test_command
     return " ".join([test_command, *(shlex.quote(argument) for argument in language.offline_test_args)])
 
 
-def offline_setup(setup_command: str, language: "Language") -> str:
+def offline_setup(setup_command: str, language: Language) -> str:
     """A setup command as a worker must run it: told to resolve from the tree, not from a network.
 
     A worker scores with `--network none` and the dependencies were vendored into the start tree
@@ -287,6 +293,10 @@ def offline_setup(setup_command: str, language: "Language") -> str:
 
     Empty for a contract that needs no telling. `go test` reads `vendor/` by itself, which is why Go
     scored offline long before any of this was written.
+
+    Returns:
+        The setup command prefixed with exports for the contract's offline environment, or
+        unchanged when none are required.
     """
     if not language.offline_env:
         return setup_command
@@ -294,7 +304,9 @@ def offline_setup(setup_command: str, language: "Language") -> str:
     # command is not always one: `cd sub && pip install -e .` would apply the variables to `cd` and
     # leave `pip` reaching for a network that is not there. A manifest's setup runs under `/bin/sh
     # -lc`, so an export reaches every part of whatever the repository declared.
-    exported = " ".join(f"{name}={shlex.quote(value)}" for name, value in sorted(language.offline_env.items()))
+    exported = " ".join(
+        f"{name}={shlex.quote(value)}" for name, value in sorted(language.offline_env.items())
+    )
     return f"export {exported}; {setup_command}"
 
 
@@ -305,6 +317,9 @@ def _pattern(source: str) -> re.Pattern[str]:
     wrote) and against whole files (when detecting which framework a repository uses). Without it a
     leading `^` anchors to the start of the entire file, so every framework scores zero and detection
     silently falls back to the default — which is how Go kept being read as standard-library tests.
+
+    Returns:
+        A case-insensitive pattern whose anchors match individual lines.
     """
     return re.compile(source, re.IGNORECASE | re.MULTILINE)
 
@@ -361,22 +376,27 @@ LANGUAGES: dict[str, Language] = {
         # valid TOML and leaves cargo working. Absence here means there was nothing to vendor, which
         # is the condition that exemption requires.
         offline_prepare=(
-            'if [ -e .cargo/config.toml ] || [ -e .cargo/config ]; then cargo vendor >/dev/null; '
-            'else mkdir -p .cargo && cargo vendor > .cargo/config.toml; fi'
+            "if [ -e .cargo/config.toml ] || [ -e .cargo/config ]; then cargo vendor >/dev/null; "
+            "else mkdir -p .cargo && cargo vendor > .cargo/config.toml; fi"
         ),
         # `.cargo` as well as `vendor`, because the config written above is what makes the vendored
         # directory findable, and a repository ignoring either would ship a tree that has the crates
         # and cannot resolve them.
         offline_artifacts=("vendor", ".cargo"),
         offline_test_args=(
-            "--config", 'source.crates-io.replace-with="vendored-sources"',
-            "--config", 'source.vendored-sources.directory="vendor"',
+            "--config",
+            'source.crates-io.replace-with="vendored-sources"',
+            "--config",
+            'source.vendored-sources.directory="vendor"',
         ),
         # The same login-shell trap Go hits: `sh -lc` sources /etc/profile, which resets PATH to the
         # Debian default and drops `/usr/local/cargo/bin` — so `rustc` and `cargo` are "not found"
         # in the very image that ships them, and a task fails for a reason that is not the task.
         # Measured in `rust:1.94-bookworm`: `rustc: command not found`, scorer exit 127.
-        scorer_preamble='command -v cargo >/dev/null 2>&1 || export PATH="$PATH:/usr/local/cargo/bin:/usr/local/rustup/bin"',
+        scorer_preamble=(
+            "command -v cargo >/dev/null 2>&1 || export "
+            'PATH="$PATH:/usr/local/cargo/bin:/usr/local/rustup/bin"'
+        ),
         ran_a_test=r"^test (\S+::)?{name}( - should panic)? \.\.\. ok$",
         failed_a_test=r"^test (\S+::)?{name}( - should panic)? \.\.\. FAILED$",
         # Measured on a scratch crate. `test result: ok.` / `test result: FAILED.` once tests ran;
@@ -657,7 +677,7 @@ ALTERNATES: dict[str, tuple[Language, ...]] = {
             inline_tests=False,
             test_command="npx vitest run",
             command_marker="vitest",
-        vendoring_replaces_setup=True,
+            vendoring_replaces_setup=True,
             # `--reporter=verbose` so Vitest prints one line per test, and the proof below names the
             # test rather than counting passes. A count cannot tell "three tests matched" from "one
             # test, three times": a Vitest config may declare several projects, and `hono` declares
@@ -674,7 +694,7 @@ ALTERNATES: dict[str, tuple[Language, ...]] = {
             # ran a thing, so it proves the opposite of what it looks like.
             runner_reported=r"Tests\s+[0-9]",
             ran_a_test=r"✓.*> {name}( [0-9.]+m?s)?$",
-            failed_a_test=r"×.*> {name}( [0-9.]+m?s)?$",
+            failed_a_test=r"\u00d7.*> {name}( [0-9.]+m?s)?$",
         ),
     ),
     "go": (
@@ -694,7 +714,7 @@ ALTERNATES: dict[str, tuple[Language, ...]] = {
             # begins it or follows a space, which is what this says. Written `[[:space:]]` rather
             # than a backslash class because the template is `shlex.split` before it is filled, and
             # shlex reads a backslash as its own escape — the class would reach Ginkgo as a letter.
-            filter_template='-ginkgo.focus=(^|[[:space:]]){name}$ {package}',
+            filter_template="-ginkgo.focus=(^|[[:space:]]){name}$ {package}",
             name_is_regex=True,
             ran_a_test=r"Ran 1 of",
             # A variant changes how tests are found and named, not what the toolchain needs: a
@@ -742,6 +762,9 @@ def resolve_contract(name: str) -> Language:
 
     Raises:
         KeyError: If nothing is called that.
+
+    Returns:
+        The named language or framework contract capable of selecting an individual test.
     """
     if name in LANGUAGES:
         contract = LANGUAGES[name]

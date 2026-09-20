@@ -32,8 +32,17 @@ _MAX_OFFLINE_ARTIFACTS = 16
 """How many paths a vendoring may name. One or two is the real shape; the bound is on the subprocess
 count that follows, since each named path becomes its own `git add -f`."""
 
-_KNOWN_KEYS = {"language", "setup_command", "test_command", "forward_env", "env", "repo", "worker_image",
-               "offline_prepare", "offline_artifacts"}
+_KNOWN_KEYS = {
+    "language",
+    "setup_command",
+    "test_command",
+    "forward_env",
+    "env",
+    "repo",
+    "worker_image",
+    "offline_prepare",
+    "offline_artifacts",
+}
 
 
 class ConfigError(ValueError):
@@ -83,6 +92,10 @@ def load_config(path: Path) -> RunnerConfig:
         ConfigError: If the file is absent, is not TOML, omits a required key, names an unknown key
             (a typo like `test_comand` would otherwise silently leave the allow-list empty), names
             a language the table does not know, or gives a value the wrong shape.
+
+    Returns:
+        The validated runner declaration with optional settings and normalized command
+        whitespace.
     """
     if not path.is_file():
         raise ConfigError(f"no declaration at {path}; a repository needs one to be mined")
@@ -114,7 +127,9 @@ def load_config(path: Path) -> RunnerConfig:
         raise ConfigError(f"{path}: `repo` must be a non-empty string, got {declared_repo!r}")
     image = raw.get("worker_image")
     if image is not None and not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", str(image)):
-        raise ConfigError(f"{path}: `worker_image` must be pinned by digest (name@sha256:<64 hex>), got {image!r}")
+        raise ConfigError(
+            f"{path}: `worker_image` must be pinned by digest (name@sha256:<64 hex>), got {image!r}"
+        )
     setup = raw.get("setup_command")
     if setup is not None and (not isinstance(setup, str) or not setup.strip()):
         raise ConfigError(f"{path}: `setup_command`, when set, must be a non-empty string")
@@ -128,8 +143,9 @@ def load_config(path: Path) -> RunnerConfig:
         # Each becomes its own `git add -f`, so a list is a subprocess count. A vendoring leaves one
         # or two directories behind — `vendor` and `.cargo`, `node_modules`, a wheel directory — and
         # a repository naming hundreds is describing something other than what it vendored.
-        raise ConfigError(f"{path}: at most {_MAX_OFFLINE_ARTIFACTS} `offline_artifacts` may be named, "
-                          f"got {len(artifacts)}")
+        raise ConfigError(
+            f"{path}: at most {_MAX_OFFLINE_ARTIFACTS} `offline_artifacts` may be named, got {len(artifacts)}"
+        )
     if prepare and not artifacts:
         # A preparation whose output is not named is a preparation that runs and reaches nobody: the
         # snapshotter freezes tracked files, and what this produces is exactly what a `.gitignore`
