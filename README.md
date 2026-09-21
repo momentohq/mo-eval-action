@@ -21,6 +21,9 @@ on:
       arms:
         description: Models to evaluate, space-separated ("none" = build the suite only)
         default: "anthropic/claude-opus-5 momento/zai-org/GLM-5.3"
+      harnesses:
+        description: Coding-agent harnesses, space-separated (mo, cc, pi)
+        default: "mo"
 permissions:
   contents: read
   pull-requests: read
@@ -41,6 +44,7 @@ jobs:
       - uses: momentohq/mo-eval-action@v1
         with:
           arms: ${{ inputs.arms }}
+          harnesses: ${{ inputs.harnesses }}
 ```
 
 ## Before enrolling: is the repository a fit?
@@ -104,6 +108,7 @@ outside it:
 | `service` | the hosted service | Base URL of the mo-eval service; override for another deployment |
 | `token` | — | Optional. Without it the job authenticates as the repository via GitHub's OIDC token (`permissions: id-token: write`); with it, a static bearer for the service |
 | `arms` | `none` | Model routes to evaluate on; `none` builds the suite without running it |
+| `harnesses` | `mo` | Space-separated `mo`, `cc`, `pi`; each runs against every model route. Set `mo pi` to compare Mo and Pi |
 | `history` | `300` | Merged pull requests offered as candidates |
 | `candidates` | `12` | Candidates the service is asked to source |
 | `config` | `.mo-eval/config.toml` | The repository's configuration |

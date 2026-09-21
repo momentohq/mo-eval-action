@@ -1719,7 +1719,7 @@ def main() -> int:
         nargs="+",
         metavar="NAME",
         default=None,
-        help="client harnesses to compare, each against every route: mo, cc, or both (default: mo)",
+        help="client harnesses to compare, each against every route: mo, cc, pi (default: mo)",
     )
     s.add_argument("--repeats", type=int, default=1)
     s.set_defaults(command_fn=suite)
@@ -1742,7 +1742,7 @@ def main() -> int:
         nargs="+",
         metavar="NAME",
         default=None,
-        help="client harnesses to compare, each against every route: mo, cc, or both (default: mo)",
+        help="client harnesses to compare, each against every route: mo, cc, pi (default: mo)",
     )
     m.add_argument("--repeats", type=int, default=1)
     m.add_argument(

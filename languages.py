@@ -79,6 +79,19 @@ class Language:
     scoring succeed with NO network: mo-eval's baseline and scorer workers run with none. For Go that
     is `go mod vendor`, after which `go test` reads `vendor/` by default. A language without such a
     command relies on the worker image to carry the dependencies."""
+    declaration: re.Pattern[str] | None = None
+    """How ANY top-level declaration is introduced — a superset of `test_declaration`.
+
+    Where a test's body ends. Attribution walks a file assigning each line to the nearest preceding
+    test, and without this it never stops: a `func Benchmark…` following a test is not a test
+    declaration, so every line of it — and of everything after it, up to the next test — is charged
+    to the test above. Measured on `gin`, that put five of eleven mined tasks' graded lists in the
+    position of naming a test the change never touched, while the prompt told the agent each one
+    failed on its tree.
+
+    Empty for a language nobody has measured, which keeps exactly today's behaviour for it rather
+    than guessing a pattern — the rule this table already follows for every other measured field.
+    """
     offline_artifacts: tuple[str, ...] = ()
     """Paths `offline_prepare` produces that the repository's own `.gitignore` will typically ignore
     (`vendor/`). They must be force-tracked in the start commit: mo-eval's snapshotter freezes
@@ -420,6 +433,9 @@ LANGUAGES: dict[str, Language] = {
         source_suffixes=(".go",),
         test_path=_pattern(r"_test\.go$"),
         test_declaration=_pattern(r"^func\s+(?:Test|Fuzz|Example)\w*\("),
+        # Every Go top-level declaration, so a test's attribution stops at the next `func` rather
+        # than running through an adjacent `Benchmark`/helper into the following test.
+        declaration=_pattern(r"^func\s"),
         test_name=_pattern(r"func\s+((?:Test|Fuzz|Example)\w*)\s*\("),
         inline_tests=False,
         test_command="go test",

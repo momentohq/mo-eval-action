@@ -24,6 +24,10 @@ inputs:
       Model routes to evaluate the suite on, space-separated (one arm each). "none" builds and
       validates the suite without running anything.
     default: "none"
+  harnesses:
+    description: >-
+      Coding-agent harnesses to evaluate against every model route, space-separated: mo, cc, pi.
+    default: "mo"
   history:
     description: How many recently merged pull requests to offer as candidates
     default: "300"
@@ -54,15 +58,18 @@ runs:
       # toolchain must already be on PATH — set it up in the workflow before this step, the same
       # way the repository's CI does.
       run: |
+        read -r -a harnesses <<< "${MO_EVAL_HARNESSES:-mo}"
         echo "MO_EVAL_OUT=${{ inputs.out || format('{0}/mo-eval', runner.temp) }}" >> "$GITHUB_ENV"
         python3 "$GITHUB_ACTION_PATH/runner/main.py" suite \
           --repo "$GITHUB_WORKSPACE" --config "${{ inputs.config }}" \
           --service "${{ inputs.service }}" \
           --history "${{ inputs.history }}" --candidates "${{ inputs.candidates }}" \
           --out "${{ inputs.out || format('{0}/mo-eval', runner.temp) }}" \
+          --harnesses "${harnesses[@]}" \
           ${{ inputs.dry-run == 'true' && '--dry-run' || '' }} \
           ${{ inputs.arms != 'none' && format('--run {0}', inputs.arms) || '' }}
       env:
+        MO_EVAL_HARNESSES: ${{ inputs.harnesses }}
         MO_EVAL_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ github.token }}   # reads this repository's merged pull requests
 
