@@ -24,7 +24,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, cast
 
-from wire import OrderResult, Step, StepResult, WorkOrder
+from mo_eval_svc.wire import OrderResult, Step, StepResult, WorkOrder
 
 _RUNNER_CREDENTIALS = (
     "MO_EVAL_TOKEN",  # the bearer this runner authenticates to the service with

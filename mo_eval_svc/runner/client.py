@@ -16,7 +16,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, cast
 
-from wire import (
+from mo_eval_svc.wire import (
     EVENT_OVERHEAD_BYTES,
     MAX_EVENT_BYTES,
     ChangeSource,
@@ -215,7 +215,7 @@ class LocalService:
     directly, so the boundary is exercised even when nothing crosses a network."""
 
     def __init__(self) -> None:
-        from service.app import (  # ruff:ignore[import-outside-top-level] - only the hosted or local-service path needs this dependency
+        from mo_eval_svc.service.app import (  # ruff:ignore[import-outside-top-level] - only the hosted or local-service path needs this dependency
             MemoryStore,
             Service,
         )
@@ -223,7 +223,7 @@ class LocalService:
         self._service = Service(MemoryStore())
 
     def _call(self, path: str, payload: dict[str, Any]) -> Any:
-        from service.app import handle  # ruff:ignore[import-outside-top-level]
+        from mo_eval_svc.service.app import handle  # ruff:ignore[import-outside-top-level]
 
         status, body = handle(self._service, "POST", path, {}, json.dumps(payload).encode(), token=None)
         if status != 200:

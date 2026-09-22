@@ -24,7 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from languages import LANGUAGES
+from mo_eval_svc.languages import LANGUAGES
 
 CONFIG_PATH = Path(".mo-eval") / "config.toml"
 

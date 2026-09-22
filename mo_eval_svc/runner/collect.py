@@ -25,8 +25,8 @@ from pathlib import Path
 from typing import Any as JSONAny
 from typing import TypedDict, Unpack
 
-from languages import Language, is_source_path
-from wire import PROTOCOL, ChangeFacts, ChangeSource, FileFacts, FileSource, RepoFacts
+from mo_eval_svc.languages import Language, is_source_path
+from mo_eval_svc.wire import PROTOCOL, ChangeFacts, ChangeSource, FileFacts, FileSource, RepoFacts
 
 _NUMSTAT = re.compile(r"^(\d+|-)\t(\d+|-)\t(.+)$")
 _PACKAGE_NAME = re.compile(r'^\s*name\s*=\s*"([^"]+)"', re.MULTILINE)
