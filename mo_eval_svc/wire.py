@@ -376,6 +376,30 @@ class ConventionSources:
 
 
 @dataclass(frozen=True)
+class ArmPayload:
+    """One arm of a run: a harness against a model route, with the settings that arm runs under.
+
+    The same thing mo-eval's `ArmSpec` is, cut down to what a caller may choose. Naming arms outright
+    is what lets a run hold two that share a harness and a route and differ in one setting — an
+    effort sweep, which a cross product cannot express because the pair appears once in it."""
+
+    harness: str
+    """Client harness this arm runs: `mo`, `cc`, `pi`, `strands`. The service refuses a name it
+    cannot run; the accepted set lives in `service/app.py` and `lane/dispatch.py`."""
+    model_route: str
+    """Gateway route the harness calls (`anthropic/claude-opus-5`)."""
+    reasoning_effort: str | None = None
+    """Grade this arm launches at, or `None` to take composition's own default.
+
+    `None` is NOT "the route decides": `mo-eval new` composes an arm that names no grade at its
+    `ORDINARY_EFFORT`, which is `high` — the same grade every arm has been composed at since before
+    a run could name one. It means "as runs have always been composed", and an arm wanting a
+    different grade names it. Nothing here can currently ask for the route's own no-hint default.
+
+    Which grades are accepted is the harness's own business — each parses the flag itself."""
+
+
+@dataclass(frozen=True)
 class RunRequest:
     """Ask the service to evaluate a suite: which arms, how many repeats. Recorded as a job; a lane
     picks it up. The runner never talks to the lane."""
@@ -383,9 +407,17 @@ class RunRequest:
     repo: str
     suite_id: str
     task_ids: list[str]
-    arms: list[str]
+    arms: list[str] = field(default_factory=list)
     """Model routes (`anthropic/claude-opus-5`, `momento/zai-org/GLM-5.3`), each paired with every
-    harness named below."""
+    harness named below. The runner's shape: a set of routes and a set of harnesses, meaning their
+    cross product. Empty when the caller named `arm_specs` instead; `arms.resolve_arms` reads one
+    shape or the other and refuses a request carrying both."""
+    arm_specs: list[ArmPayload] | None = None
+    """Arms named outright, in place of the `harnesses` x `arms` cross product.
+
+    `None` rather than an empty list, because the two mean different things here: `None` is a caller
+    using the older shape, `[]` is a caller who meant to name arms and named none. Resolution
+    refuses the second rather than silently falling back to the first."""
     repeats: int = 1
     harnesses: list[str] | None = None
     """Client harnesses to compare — `mo`, `cc`, `pi` — and the service refuses a name it cannot run.
@@ -431,11 +463,22 @@ class RunSummary:
     state: str
     """pending | running | done | failed — where the job record sits."""
     arms: list[str]
+    """Model routes this run measures, one per arm and so repeated when two arms share a route.
+
+    Kept for a reader that knows only routes. It cannot describe an arm: two arms alike but for
+    their grade are the same route twice, which reads as one thing measured twice rather than as
+    the comparison it is. Prefer `arm_specs`."""
     task_count: int
     cells_url: str | None
     """Short-lived GET for the suite-level cells.json, present once the lane has written it."""
     suite_url: str | None
     rubric_url: str | None
+    arm_specs: list[ArmPayload] | None = None
+    """Every arm outright — harness, route and the grade it launched at.
+
+    `None` on a run recorded before arms could be named, where `arms` and the run's harnesses are
+    all there is to say. A reader prefers this when it is here and falls back to `arms` when it is
+    not, rather than showing a sweep as one route repeated."""
     actor: str | None = None
     """The GitHub login that started the run, as its ID token named it.
 
@@ -599,7 +642,7 @@ def event_cost(text: str) -> int:
     return len(json.dumps(text)) - 2
 
 
-PROTOCOL = 4
+PROTOCOL = 5
 """The revision of this protocol the copy of these types in THIS tree speaks.
 
 Sent by the runner as `RepoFacts.protocol` so the service knows which fields it may put in an order.
@@ -619,6 +662,15 @@ is the number that shipped with it.
    shown which repositories they may open rather than having to name one. Declared for the same
    reason as 3 and with the same caveat — these cross between the BFF and a browser, so a runner
    neither sends nor receives them and there is nothing to withhold from an older one.
+5. `ArmPayload`, `RunRequest.arm_specs` and `RunSummary.arm_specs`: a run may name its arms outright
+   rather than as a cross product of harnesses and routes, which cannot express two arms alike but
+   for one setting. `RunRequest.arms` becomes optional in the same change, since an authored request
+   carries no cross product to put there.
+
+   Declared rather than fixed, for two different reasons. A runner SENDS a `RunRequest`: an older
+   one names the cross product and still always sends `arms`, so nothing it sends stops decoding
+   and there is nothing to withhold from it. `RunSummary` it never asks for, as in 3. The number
+   moves because the Action vendors this whole file and its surface did.
 """
 
 MAX_DECODED_ENTRIES = 1_000_000

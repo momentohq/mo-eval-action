@@ -251,6 +251,18 @@ class Language:
     """Shell lines the generated scorer runs first — environment the language's toolchain needs that a
     scoring shell may not provide. Kept per language rather than per repository: it is a fact about
     the toolchain, not the code under test."""
+    build_cache_variable: str = ""
+    """Environment variable pointing the toolchain's build cache at a directory, rendered into a
+    bundle's manifest so mo-eval seeds it once per task and hands every grading worker a private
+    writable clone of it (mo-eval 0.15.2+; older images reject the field). Empty for a toolchain
+    nobody has measured, which then compiles in each worker as before.
+
+    Only for a cache addressed by its inputs, where a stale or foreign entry is a miss and never a
+    wrong answer. Go's `GOCACHE` is; a Cargo `target/` directory is not, and is left out."""
+    build_cache_seed: str = ""
+    """Command that fills that cache from the start tree: compiles the code and its tests and runs
+    none. Running any would store results a grading worker could read back. Declared together with
+    `build_cache_variable`, never alone."""
 
 
 def is_source_path(path: str, language: Language) -> bool:
@@ -460,6 +472,10 @@ LANGUAGES: dict[str, Language] = {
         # found" in the very image that ships it, and a baseline "fails" for a reason that is not
         # the task. Re-adding the standard Go locations is harmless where they are already present.
         scorer_preamble='command -v go >/dev/null 2>&1 || export PATH="$PATH:/usr/local/go/bin:/go/bin"',
+        # Measured on gin in `golang:1.26-bookworm` as uid 1000: `go test ./...` takes 33s cold and 3s
+        # against a cache this seed filled, with no test result served from it.
+        build_cache_variable="GOCACHE",
+        build_cache_seed="go test -run '^$' ./...",
         offline_prepare="go mod vendor",
         offline_artifacts=("vendor",),
         # `GOPATH` moves the module cache, which is the download; `GOCACHE` already follows HOME.
@@ -736,6 +752,10 @@ ALTERNATES: dict[str, tuple[Language, ...]] = {
             # A variant changes how tests are found and named, not what the toolchain needs: a
             # Ginkgo repository is a Go repository, and its bundles vendor and repair PATH the same way.
             scorer_preamble='command -v go >/dev/null 2>&1 || export PATH="$PATH:/usr/local/go/bin:/go/bin"',
+            # Measured on gin in `golang:1.26-bookworm` as uid 1000: `go test ./...` takes 33s cold and 3s
+            # against a cache this seed filled, with no test result served from it.
+            build_cache_variable="GOCACHE",
+            build_cache_seed="go test -run '^$' ./...",
             offline_prepare="go mod vendor",
             offline_artifacts=("vendor",),
         ),

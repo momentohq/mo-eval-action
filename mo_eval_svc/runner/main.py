@@ -13,6 +13,7 @@ the rest went — because a suite that comes back empty must say which stage emp
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import posixpath
@@ -238,6 +239,39 @@ def write_local_suite(
     if root.exists():
         shutil.rmtree(root)
     root.mkdir(parents=True)
+    try:
+        return _build_local_suite(package, repo, root, meta, config, cache)
+    except BaseException:
+        # A refused bundle must not survive its refusal. The score check runs AFTER the overlay is
+        # written, so what it declines is a complete tree — manifest and all — and `_hand_off`
+        # screens failed builds by asking whether the manifest is there. Left on disk, a refused
+        # bundle passes that screen and ships: measured on `momentohq/hono`, where the check named
+        # all four tasks, the run still reported `validated 4 of 4`, and the lane returned
+        # `scorer_error` on every cell — the outcome the refusal had predicted in words.
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+
+
+def _build_local_suite(
+    package: TaskPackage,
+    repo: Path,
+    root: Path,
+    meta: dict[str, JSONAny],
+    config: RunnerConfig | None,
+    cache: Path | None,
+) -> Path:
+    """Fill a prepared bundle root with the task's start tree, overlay and start commit.
+
+    Split from `write_local_suite` so one `except` there owns removing a tree that never shipped,
+    rather than every failure path remembering to.
+
+    Returns:
+        The committed, scoreable task start tree.
+
+    Raises:
+        OrderError: If a declared offline artifact is absent, or the task cannot be prepared and
+            scored in its worker image.
+    """
     _export_into(repo, commit_or_refuse(meta["parent_commit"]), root, _EXPORT_SECONDS)
     for path in root.rglob("*"):
         os.utime(path, None, follow_symlinks=False)
@@ -540,9 +574,12 @@ def _break_hard_links(root: Path) -> None:
     """Give every path in the start tree its own inode.
 
     `tarfile` writes the FIRST path to an inode as a regular file and every later one as a hard-link
-    member, and the lane admits neither hard links nor symlinks — its allow-list is regular files and
-    directories, and that is the whole list. So a tree where two paths share an inode produces an
-    archive the lane refuses, in the same way and at the same late moment as a symlink did.
+    member, and the lane's allow-list refuses that member type. So a tree where two paths share an
+    inode produces an archive the lane refuses, at the same late moment a symlink once did.
+
+    Symlinks are the opposite case and are KEPT: the lane admits an in-tree relative one, and a link
+    is semantics rather than a second name for the same bytes, so copying its target is lossy.
+    Breaking a hard link is not — both paths keep the content they shared.
 
     Measured on `momentohq/hono`: one pair in 33,249 files, `node_modules/workerd/bin/workerd`, which
     bun installs by hard-linking from its own cache — and 131 MB, because the file it shares is a
@@ -550,7 +587,8 @@ def _break_hard_links(root: Path) -> None:
     for every file with a link count above one: a file hard-linked to something OUTSIDE the tree
     appears once here and is archived as itself.
 
-    Runs after `_resolve_symlinks`, which creates files of its own.
+    Runs after the link check, which refuses a tree the lane could not unpack; ordering is not
+    load-bearing beyond that, since nothing before this creates or removes a path.
     """
     kept: set[tuple[int, int]] = set()
     for path in sorted(root.rglob("*")):
@@ -1096,6 +1134,31 @@ def issue_orders(
     )
 
 
+def suite_exit(*, written: int, shipped: int, asked_to_run: bool) -> int:
+    """What a finished `suite` run is worth as an exit code.
+
+    A task is written BEFORE its containerized bundle is built, so `written` counts tasks that
+    exist on disk — not tasks that are running. A suite whose every bundle failed therefore has a
+    non-empty `written` and shipped nothing, and reporting success on that is the "validated N of N
+    while shipping nothing" this module already warns about.
+
+    Args:
+        written: Tasks written to `--out`.
+        shipped: Bundles the hand-off actually handed to the service; zero when none was asked for.
+        asked_to_run: Whether `--run` named any route. Without it there is nothing to ship and
+            `written` alone is the outcome.
+
+    Returns:
+        Zero when the run produced what it was asked for, three when it produced nothing runnable —
+        the same three `submit` uses for a tree that handed off nothing.
+    """
+    if not written:
+        return 3
+    if asked_to_run and not shipped:
+        return 3
+    return 0
+
+
 def suite(arguments: argparse.Namespace) -> int:
     repo = arguments.repo.resolve()
     # Before anything can fail: `--out` may be reused, and a funnel record left by the previous
@@ -1120,6 +1183,15 @@ def suite(arguments: argparse.Namespace) -> int:
         return 2
 
     out = arguments.out.resolve()
+    # Before anything is written into it. `_package_each_verdict` creates `tasks/` and
+    # `local-suite/` well before a hand-off could look at them, so a PRE-EXISTING link at either
+    # door would put this run's output outside `--out` and the refusal would come too late to
+    # matter.
+    try:
+        refuse_a_linked_tree(out)
+    except OrderError as failure:
+        print(f"config: {failure}", file=sys.stderr)
+        return 2
     wire = Wire(root=out / "wire")
     contract = _contract_name(repo, config.language, config.test_command)
     name = _repo_name(repo, config.repo)
@@ -1186,28 +1258,13 @@ def suite(arguments: argparse.Namespace) -> int:
         print(f"service: {failure}", file=sys.stderr)
         return 1
 
-    written = []
+    written: list[Path] = []
     # One toolchain cache for every task of this suite. A sibling of `local-suite/`, never inside a
     # bundle: `write_local_suite` force-adds the declared offline artifacts, and a cache under a
     # task's tree would be frozen into the start state and shipped to every worker.
     prepare_cache = out / ".prepare-cache"
     prepare_cache.mkdir(parents=True, exist_ok=True)
-    for verdict in report.verdicts:
-        mark = "VALIDATED" if verdict.validated else "rejected "
-        print(f"  {mark} {verdict.change_id[:9]}  {verdict.detail}")
-        if verdict.task is not None:
-            written.append(write_package(verdict.task, out / "tasks"))
-            try:
-                bundle = write_local_suite(
-                    verdict.task, repo, out / "local-suite", config, cache=prepare_cache
-                )
-            except (OrderError, ValueError, OSError) as failure:
-                # The task itself is already written and still valid. Only its containerized
-                # bundle could not be built, and one task's bundle failing is not the suite's end.
-                print(f"             local-suite bundle failed: {failure}", file=sys.stderr)
-                continue
-            if bundle is not None:
-                print(f"             local-suite bundle → {bundle}")
+    packaged, refusals = _package_each_verdict(report, repo, out, config, prepare_cache, written)
     # Before hand-off, which is where disk peaks: it holds every tree AND every archive at once.
     _discard_the_preparation_cache(prepare_cache)
 
@@ -1220,11 +1277,14 @@ def suite(arguments: argparse.Namespace) -> int:
         written,
         evidence=_evidence(results, report),
         record=out / FUNNEL_RECORD,
+        packaged=packaged,
+        refusals=refusals,
     )
+    shipped = 0
     if written and arguments.run:
         conventions = _conventions(repo, facts.repo, min(arguments.history, 120))
         try:
-            _hand_off(
+            shipped = _hand_off(
                 client,
                 facts.repo,
                 out,
@@ -1232,6 +1292,7 @@ def suite(arguments: argparse.Namespace) -> int:
                 repeats=arguments.repeats,
                 conventions=conventions,
                 harnesses=arguments.harnesses,
+                refusals=refusals,
             )
         except ServiceError as failure:
             # The validated tasks are already on disk, so this is recoverable: the same hand-off is
@@ -1242,24 +1303,34 @@ def suite(arguments: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-    return 0 if written else 3
+        if not shipped:
+            print(
+                f"  {len(written)} task(s) validated, but no bundle was handed off; nothing is running",
+                file=sys.stderr,
+            )
+    return suite_exit(written=len(written), shipped=shipped, asked_to_run=bool(arguments.run))
 
 
 def submit(arguments: argparse.Namespace) -> int:
     """Hand an already-validated `--out` tree to the service for evaluation.
 
     Returns:
-        Zero after hand-off succeeds, or two after a reported service error.
+        Zero after a hand-off that shipped at least one bundle; two for a refusal — a reported
+        service error, or a tree this runner will not walk; three when the tree handed off nothing,
+        so a caller can tell "nothing was there to run" from "the run was refused" — `suite` uses
+        the same three for a suite that yielded no task.
     """
+    out = Path(arguments.out)
+    repo_name = arguments.repo_name
     conventions = None
     if arguments.conventions_from is not None:
-        conventions = _conventions(Path(arguments.conventions_from), arguments.repo_name, arguments.history)
+        conventions = _conventions(Path(arguments.conventions_from), repo_name, arguments.history)
     try:
         client = client_for(arguments.service, arguments.token or os.environ.get("MO_EVAL_TOKEN"))
-        _hand_off(
+        shipped = _hand_off(
             client,
-            arguments.repo_name,
-            Path(arguments.out),
+            repo_name,
+            out,
             routes=arguments.run,
             repeats=arguments.repeats,
             conventions=conventions,
@@ -1270,6 +1341,17 @@ def submit(arguments: argparse.Namespace) -> int:
         # and an exit code, not a traceback.
         print(f"service: {failure}", file=sys.stderr)
         return 2
+    except OrderError as failure:
+        # `_hand_off` refuses a tree it will not read — a symlinked `local-suite`. On THIS path that
+        # tree is the caller's, so the refusal is reachable, and reaching it must cost an exit code
+        # rather than a traceback like every other refusal here.
+        print(f"submit: {failure}", file=sys.stderr)
+        return 2
+    if not shipped:
+        # `suite`'s code for "nothing survived". A hand-off that shipped no bundle recorded no run,
+        # so reporting success would tell a workflow its arms are running when nothing is.
+        print(f"submit: {out} handed off no bundle; nothing is running", file=sys.stderr)
+        return 3
     return 0
 
 
@@ -1331,6 +1413,64 @@ acceptance script, and `mo-eval plan` refuses a bundle without it — so its abs
 thing the lane would discover, discovered here instead."""
 
 
+_MAX_SUITE_BUNDLES = 512
+"""How many bundles this runner will walk in a suite tree.
+
+A suite is the handful of tasks a repository's merged pull requests yielded — `candidates` caps the
+ask at a couple of dozen. On the `submit` path the tree is a cache or an artifact the CALLER named,
+so the entry count is chosen by whoever wrote it rather than by this run; the bound is far above any
+honest suite and far below a directory that would cost the runner its memory to list."""
+
+
+def refuse_a_linked_tree(out: Path) -> None:
+    """Refuse a suite tree whose own doors are links, before anything reads or writes through them.
+
+    Called at both ends deliberately: `suite` writes into this tree, and a PRE-EXISTING
+    `local-suite` or `tasks` link would have packaging create content outside `--out` long before a
+    hand-off could notice; `submit` only reads, but the tree is the caller's. One check, run at
+    whichever end comes first.
+
+    Only these three. An ANCESTOR of `out` may legitimately be a link — `/tmp` is one on macOS, and
+    a runner's temp path can be — so walking the ancestry would refuse honest trees. `suite` passes
+    an already-resolved `out`, where the first test is a no-op and the children are the point;
+    `submit` passes the path as given, where all three matter.
+
+    Raises:
+        OrderError: If `out` or either of the directories it owns is a symlink.
+    """
+    for named in (out, out / "local-suite", out / "tasks"):
+        if named.is_symlink():
+            raise OrderError(f"{named} is a symlink; a suite is a directory, not a link to one")
+
+
+def confined_bundles(out: Path) -> list[Path]:
+    """The bundle directories of the suite under `out`, or a refusal.
+
+    The one place that decides what this runner may walk in a tree it did not necessarily produce:
+    the doors are not links, the listing is bounded, and no entry is a link either. Everything else
+    under `out` is reached through [`_safe_relative`], which refuses a link at any component.
+
+    Returns:
+        The bundle directories, sorted; empty when the suite directory is absent.
+
+    Raises:
+        OrderError: If a door is a link, or the listing is larger than this runner will walk.
+    """
+    refuse_a_linked_tree(out)
+    suite_dir = out / "local-suite"
+    if not suite_dir.is_dir():
+        return []
+    # Bounded BEFORE sorting: `sorted` materializes the whole listing, so a tree carrying a million
+    # entries would cost that list before any of them was looked at. One more than the cap is read,
+    # which is what makes "too many" distinguishable from "exactly the cap".
+    entries = list(itertools.islice(suite_dir.iterdir(), _MAX_SUITE_BUNDLES + 1))
+    if len(entries) > _MAX_SUITE_BUNDLES:
+        raise OrderError(
+            f"{suite_dir} holds more than {_MAX_SUITE_BUNDLES} entries; a suite is a handful of tasks"
+        )
+    return sorted(entry for entry in entries if entry.is_dir() and not entry.is_symlink())
+
+
 def _hand_off(
     client: RunClient,
     repo_name: str,
@@ -1339,8 +1479,14 @@ def _hand_off(
     repeats: int,
     conventions: ConventionSources | None = None,
     harnesses: list[str] | None = None,
-) -> None:
+    refusals: list[str] | None = None,
+) -> int:
     """Upload every validated bundle to the service's storage and record a run for the lane.
+
+    Returns:
+        How many bundles were handed off. Zero is a real outcome — a suite whose bundles were all
+        refused, or a tree with none — and it is returned rather than printed alone so a caller can
+        refuse to report success for a run that shipped nothing.
 
     The bundles are tarred here and PUT to presigned URLs, so the service never receives the bytes
     (a bundle is a vendored start tree — far larger than a function is willing to carry). What is
@@ -1350,13 +1496,23 @@ def _hand_off(
     Raises:
         ServiceError: If uploading a bundle fails or the service refuses the upload or run
             request.
+        OrderError: If `local-suite` is a symlink rather than a directory — on the `submit` path
+            that tree is the caller's, and a link there would have every bundle tarred through it.
     """
 
-    suite_dir = out / "local-suite"
-    bundles = sorted(p for p in suite_dir.iterdir() if p.is_dir()) if suite_dir.is_dir() else []
+    bundles = confined_bundles(out)
     if not bundles:
-        print("  nothing to hand off: no local-suite bundles (does the config declare worker_image?)")
-        return
+        if refusals:
+            # Not a guess. A suite whose every bundle was refused HAS a worker image — refusing is
+            # what that image just did — and telling the customer to check whether they declared one
+            # sends them to the one place the answer is not.
+            print(
+                f"  nothing to hand off: all {len(refusals)} bundle(s) were refused before shipping; "
+                f"see the refusals above"
+            )
+        else:
+            print("  nothing to hand off: no local-suite bundles (does the config declare worker_image?)")
+        return 0
     # A bundle whose build failed is still a DIRECTORY: `write_local_suite` creates the root, exports
     # the start tree into it, and only then lays the overlay over it — so a failure in between leaves
     # a tree with no `.mo-eval/`. Handed off, nothing downstream notices (the upload checks sizes, and
@@ -1379,7 +1535,7 @@ def _hand_off(
         bundles = [bundle for bundle in bundles if bundle.name not in set(unscoreable)]
     if not bundles:
         print("  nothing to hand off: no bundle carries a suite to score", file=sys.stderr)
-        return
+        return 0
     task_ids = [p.name for p in bundles]
     suite_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{task_ids[0][-8:]}"
     # Archived before the URLs are asked for, so the request can say how large each bundle is and
@@ -1432,15 +1588,41 @@ def _hand_off(
             archive.unlink(missing_ok=True)
     titles, categories, sizes = {}, {}, {}
     for task_id in task_ids:
-        meta = out / "tasks" / task_id / "meta.json"
-        if meta.is_file():
+        # Through the same door as the bundles: a cached `tasks/` or task directory that is a link
+        # would otherwise read a meta from outside the tree and send its labels in the run request.
+        try:
+            meta = _safe_relative(f"tasks/{task_id}/meta.json", out)
+        except ValueError as failure:
+            print(f"  {task_id}: {failure}; its labels are omitted", file=sys.stderr)
+            continue
+        if not meta.is_file():
+            continue
+        # `submit` reaches here with a tree the CALLER named — a cache or an artifact, not this
+        # run's own output. A truncated, non-object or unreadable meta is that tree's problem, not
+        # a reason to end a hand-off that has already uploaded: the labels below are what a report
+        # is titled with, and a run without them is a run with worse labels, not a failed one.
+        try:
             record = json.loads(meta.read_text())
-            titles[task_id] = record.get("title", "")
-            generated = record.get("generated", {})
-            if generated.get("category"):
-                categories[task_id] = generated["category"]
-            if generated.get("size"):
-                sizes[task_id] = generated["size"]
+        except (OSError, ValueError) as failure:
+            print(f"  {task_id}: meta.json unreadable ({failure}); its labels are omitted", file=sys.stderr)
+            continue
+        if not isinstance(record, dict):
+            print(f"  {task_id}: meta.json is not an object; its labels are omitted", file=sys.stderr)
+            continue
+        title = record.get("title")
+        titles[task_id] = title if isinstance(title, str) else ""
+        generated = record.get("generated")
+        if not isinstance(generated, dict):
+            continue
+        # Checked, not merely truthy. `RunRequest.categories`/`.sizes` are `dict[str, str]`, and a
+        # reused cache is not this run's output: a non-string here would serialize into the typed
+        # request and the service would refuse `/v1/runs` AFTER the bundles were uploaded — which
+        # is the opposite of what the comment above promises, a bad meta costing its labels alone.
+        category, size = generated.get("category"), generated.get("size")
+        if isinstance(category, str) and category:
+            categories[task_id] = category
+        if isinstance(size, str) and size:
+            sizes[task_id] = size
     # No harness named stays unnamed all the way to the service, which is what decides what that
     # means — rather than a default here to drift from it, or a key in a request that predates it.
     ticket = client.runs(
@@ -1461,12 +1643,62 @@ def _hand_off(
         f"  run {ticket.run_id} recorded ({ticket.job_key}); "
         f"results will appear under {ticket.results_prefix}"
     )
+    return len(task_ids)
 
 
 FUNNEL_RECORD = "funnel.txt"
 """Where under `--out` the funnel block is kept. The Action's summary step reads it to know the
 runner got as far as reporting a funnel: `GITHUB_STEP_SUMMARY` is a different file for every step,
 so the block the runner appended to its own is invisible to the step that follows."""
+
+
+def _package_each_verdict(
+    report: VerdictReport,
+    repo: Path,
+    out: Path,
+    config: RunnerConfig | None,
+    cache: Path,
+    written: list[Path],
+) -> tuple[list[Path], list[str]]:
+    """Write each validated task and its containerized bundle, recording what could not be shipped.
+
+    A function rather than a loop inside `suite` so the counts the funnel reports can be tested
+    against the code that produces them. Asserting them on `_funnel` alone leaves the wiring
+    untested: the tally renders correctly from arguments nothing fills in.
+
+    Args:
+        report: Verdicts from validation, carrying each task.
+        repo: Checkout the start trees are exported from.
+        out: Suite output root; tasks and bundles are written beneath it.
+        config: Repository configuration, or `None` when it declares nothing.
+        cache: Shared preparation cache for the run.
+        written: Task package paths, appended to in order.
+
+    Returns:
+        The bundles written, and a message for each one that could not be.
+    """
+    packaged: list[Path] = []
+    refusals: list[str] = []
+    for verdict in report.verdicts:
+        mark = "VALIDATED" if verdict.validated else "rejected "
+        print(f"  {mark} {verdict.change_id[:9]}  {verdict.detail}")
+        if verdict.task is None:
+            continue
+        written.append(write_package(verdict.task, out / "tasks"))
+        try:
+            bundle = write_local_suite(verdict.task, repo, out / "local-suite", config, cache=cache)
+        except (OrderError, ValueError, OSError) as failure:
+            # The task itself is already written and still valid. Only its containerized bundle
+            # could not be built, and one task's bundle failing is not the suite's end. Counted as
+            # well as printed: stderr is not where a customer reads whether their suite worked, and
+            # a green run reporting `validated N of N` while shipping nothing is what this records.
+            print(f"             local-suite bundle failed: {failure}", file=sys.stderr)
+            refusals.append(str(failure))
+            continue
+        if bundle is not None:
+            packaged.append(bundle)
+            print(f"             local-suite bundle → {bundle}")
+    return packaged, refusals
 
 
 def _funnel(
@@ -1480,6 +1712,8 @@ def _funnel(
     dry_run: bool = False,
     evidence: str = "",
     record: Path | None = None,
+    packaged: list[Path] | None = None,
+    refusals: list[str] | None = None,
 ) -> None:
     """Where every offered change went. The number a user needs is not how many tasks they got,
     but why they did not get more. `ran` is how many orders ran, or on a dry run how many would
@@ -1520,6 +1754,13 @@ def _funnel(
         validated = sum(1 for v in report.verdicts if v.validated)
         lines.append(f"validated  {validated:>4} of {ran} run")
         lines += [f"           → {path}" for path in written]
+        # A task validates on THIS host; a bundle also has to be scoreable in the declared worker
+        # image. The two diverge exactly when those environments disagree, which is the failure the
+        # packaging check exists to catch — so a run that validates tasks and packages none must
+        # show the contradiction rather than report the first number and fall silent.
+        attempted = len(packaged or []) + len(refusals or [])
+        if attempted:
+            lines.append(f"packaged   {len(packaged or []):>4} of {attempted}   " + _refusals(refusals or []))
         diagnosis = _diagnosis(request, response, report, ran=ran) if not written else ""
     if evidence:
         lines += ["", *evidence.rstrip("\n").splitlines()]
@@ -1690,6 +1931,37 @@ def _diagnosis(request: SourceRequest, response: OrdersResponse, report: Verdict
     hint = next((hint for phrase, hint in _HINTS if phrase in reason), "")
     sentence = f"nothing survived {stage}: {count} of {total} {unit} {reason}"
     return f"{sentence}. {hint}" if hint else sentence
+
+
+def _refusals(refusals: list[str]) -> str:
+    """Tally why bundles were refused, one entry per distinct reason.
+
+    Each message leads with the task id that could not be packaged, which makes every one unique —
+    so the id is dropped before grouping, the way `_reasons` groups a rejection's wording rather
+    than its subject. Bounded like the rest of the funnel: a refusal carries the scorer's own
+    output, and the whole tail belongs in the evidence block, not in a one-line tally.
+
+    Args:
+        refusals: Messages from bundles that could not be packaged.
+
+    Returns:
+        A `refused: …` tally, or empty when nothing was refused.
+    """
+    if not refusals:
+        return ""
+    counts: dict[str, int] = {}
+    for message in refusals:
+        _, separator, reason = message.partition(": ")
+        first = (reason if separator else message).splitlines()[0].strip()
+        counts[first[:_REFUSAL_REASON_CHARS]] = counts.get(first[:_REFUSAL_REASON_CHARS], 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    top = ", ".join(f"{count} {reason}" for reason, count in ordered[:2])
+    more = f", +{len(ordered) - 2} more" if len(ordered) > 2 else ""
+    return f"refused: {top}{more}"
+
+
+_REFUSAL_REASON_CHARS = 160
+"""How much of a refusal survives into the one-line tally; the rest is the scorer's own output."""
 
 
 def _reasons(rejections: list[RejectionSummary]) -> str:

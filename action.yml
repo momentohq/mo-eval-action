@@ -26,7 +26,7 @@ inputs:
     default: "none"
   harnesses:
     description: >-
-      Coding-agent harnesses to evaluate against every model route, space-separated: mo, cc, pi.
+      Coding-agent harnesses to evaluate against every model route, space-separated: mo, cc, pi, strands.
     default: "mo"
   history:
     description: How many recently merged pull requests to offer as candidates
@@ -47,11 +47,39 @@ inputs:
       "true" mines and selects, prints the funnel, and runs nothing — seconds instead of minutes,
       for a first look at whether a repository is a fit before any candidate is validated.
     default: "false"
+  repeats:
+    description: >-
+      How many times to run each arm, so a comparison rests on more than one sample. The service
+      caps this and REFUSES an over-cap request rather than quietly running fewer — a run recorded
+      as the cap when more was asked for would be a different benchmark reported as yours.
+    default: "1"
+  repo-name:
+    description: >-
+      The `owner/name` the suite was mined as, which is the tenant the service proved its tasks
+      under. Defaults to this repository. Set it only when the repository's config declares an
+      upstream with `repo = "owner/name"` — on a fork that declaration is the upstream, so the
+      checkout's own name would be a different tenant, whose tasks these are not.
+    default: ${{ github.repository }}
+  reuse-suite:
+    description: >-
+      Path to a suite a previous run already mined and validated. Set it to skip mining and
+      validation entirely and only run `arms` against that suite — which is the expensive half: the
+      mining reads merged pull requests and the validation runs the repository's own tests once per
+      candidate, while changing the model or harness changes neither. Leave empty to mine a fresh
+      suite. The path must outlive the run that built it, because a runner's temp space does not —
+      use a cache. NOT this Action's own artifact: that carries the task records for reading
+      (`tasks/`, `wire/`, `funnel.txt`) and deliberately not the runnable bundles, so a suite
+      restored from it has no `local-suite/` and is refused.
+    default: ""
 
 runs:
   using: composite
   steps:
     - name: mine and validate
+      # Skipped entirely when `reuse-suite` names a suite already proved: mining reads merged pull
+      # requests and validation runs the repository's own tests per candidate, and neither depends on
+      # which model or harness the arms name.
+      if: inputs.reuse-suite == ''
       shell: bash
       # The runner is standard-library Python: nothing to install. It runs from the action's own
       # checkout, so nothing of it lands in the repository being evaluated. The repository's own
@@ -66,29 +94,144 @@ runs:
           --history "${{ inputs.history }}" --candidates "${{ inputs.candidates }}" \
           --out "${{ inputs.out || format('{0}/mo-eval', runner.temp) }}" \
           --harnesses "${harnesses[@]}" \
+          --repeats "$MO_EVAL_REPEATS" \
           ${{ inputs.dry-run == 'true' && '--dry-run' || '' }} \
           ${{ inputs.arms != 'none' && format('--run {0}', inputs.arms) || '' }}
       env:
         MO_EVAL_HARNESSES: ${{ inputs.harnesses }}
+        # Through the environment, never `${{ … }}` inside the script: an expression is substituted
+        # into the source BEFORE the shell parses it, so `$(…)` in an input runs even inside double
+        # quotes. An environment value is data the shell expands, not source it re-reads.
+        MO_EVAL_REPEATS: ${{ inputs.repeats }}
         MO_EVAL_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ github.token }}   # reads this repository's merged pull requests
+
+    - name: run an already-proved suite
+      # The other half of the split: `submit` uploads the bundles this suite already holds and
+      # records the run, with no mining and no validation. Bundles are re-uploaded because a run
+      # names storage keys the service resolves for itself; that is a transfer, not a re-proof, and
+      # it is the cheap half. Running purely by suite id, with no transfer at all, needs the service
+      # to answer which tasks a repository has already proved — a wire change, tracked separately.
+      #
+      # `--conventions-from` is NOT optional here. Without it the conventions judge loses the
+      # sources it grades against, so a reused suite would score differently from a freshly mined
+      # one for a reason nothing in the output names.
+      #
+      # `--repo-name` comes from the `repo-name` input, which defaults to this repository. An input
+      # rather than something read back out of the suite tree: that tree arrives through a cache or
+      # an artifact, and parsing a file from it to decide which TENANT to submit under would put an
+      # untrusted document in charge of that choice. A declaration by the workflow cannot be steered
+      # by whoever wrote the cache.
+      if: inputs.reuse-suite != ''
+      shell: bash
+      run: |
+        read -r -a harnesses <<< "${MO_EVAL_HARNESSES:-mo}"
+        read -r -a arms <<< "$MO_EVAL_ARMS"
+        # Refused, not escaped. `GITHUB_ENV` is a line-oriented file, so a newline in the value
+        # becomes a SECOND record — `MO_EVAL_OUT=<path>\nMO_EVAL_DRY_RUN=true` sets both, which
+        # would redirect the summary and the artifact. A delimiter form can be escaped by a value
+        # carrying the delimiter; a suite path with a newline in it is not a path anyone meant.
+        case $MO_EVAL_REUSE in
+          *[$'\n\r']*)
+            echo "reuse-suite: the path contains a newline, which would write extra records into GITHUB_ENV" >&2
+            exit 2
+            ;;
+        esac
+        if [ "$MO_EVAL_ARMS" = "none" ]; then
+          echo "reuse-suite: set 'arms' to the model route(s) to run — reusing a suite exists to run arms against it, and 'none' asks for nothing" >&2
+          exit 2
+        fi
+        # `dry-run` promises the Action runs nothing. This step has no mining pass to stop short of,
+        # so honouring it would mean doing nothing at all while the summary described a fit check —
+        # and ignoring it would spend a model budget a caller asked not to spend. Neither is a
+        # reading of the contract, so the combination is refused.
+        if [ "$MO_EVAL_DRY_RUN" = "true" ]; then
+          echo "reuse-suite: 'dry-run' cannot apply to a suite that is already mined and validated — drop one of the two" >&2
+          exit 2
+        fi
+        test -d "$MO_EVAL_REUSE/local-suite" || {
+          echo "reuse-suite: '$MO_EVAL_REUSE' holds no local-suite/ — it is not a suite a previous run left, or it did not outlive that run" >&2
+          exit 2
+        }
+        # LAST, after every refusal above. `GITHUB_ENV` persists for the whole job, and the summary
+        # step runs `if: always()` — so writing this before a refusal would point that step at a
+        # path this step just rejected, and it would report on it as though it had been used.
+        echo "MO_EVAL_OUT=$MO_EVAL_REUSE" >> "$GITHUB_ENV"
+        python3 "$GITHUB_ACTION_PATH/runner/main.py" submit \
+          --out "$MO_EVAL_REUSE" \
+          --repo-name "$MO_EVAL_REPO_NAME" \
+          --service "$MO_EVAL_SERVICE" \
+          --conventions-from "$GITHUB_WORKSPACE" \
+          --history "$MO_EVAL_HISTORY" \
+          --harnesses "${harnesses[@]}" \
+          --repeats "$MO_EVAL_REPEATS" \
+          --run "${arms[@]}"
+      env:
+        # Every input arrives as an environment value, not as `${{ … }}` spliced into the script —
+        # see the note on the mining step's env. This step is the newer one and takes no expression
+        # inside its `run:` at all.
+        MO_EVAL_HARNESSES: ${{ inputs.harnesses }}
+        MO_EVAL_ARMS: ${{ inputs.arms }}
+        MO_EVAL_REUSE: ${{ inputs.reuse-suite }}
+        MO_EVAL_REPEATS: ${{ inputs.repeats }}
+        MO_EVAL_DRY_RUN: ${{ inputs.dry-run }}
+        MO_EVAL_SERVICE: ${{ inputs.service }}
+        MO_EVAL_HISTORY: ${{ inputs.history }}
+        MO_EVAL_REPO_NAME: ${{ inputs.repo-name }}
+        MO_EVAL_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ github.token }}   # reads review comments for the conventions judge
 
     - name: what crossed the boundary, and what survived
       if: always()
       shell: bash
       env:
         MO_EVAL_DRY_RUN: ${{ inputs.dry-run }}
+        MO_EVAL_REUSED: ${{ inputs.reuse-suite }}
       run: |
         out="$MO_EVAL_OUT"
         echo '## mo-eval suite' >> "$GITHUB_STEP_SUMMARY"
+        # A reused suite's tree still holds the wire audit and funnel of the run that MINED it, and
+        # this step reads that tree. Said plainly rather than shown unlabelled: nothing crossed the
+        # boundary this run, so presenting that audit as this run's would report a mining pass that
+        # did not happen.
+        if [ -n "$MO_EVAL_REUSED" ]; then
+          echo "_reused the suite at \`$MO_EVAL_REUSED\` — nothing was mined or validated this run; the audit and funnel below are from the run that built it_" >> "$GITHUB_STEP_SUMMARY"
+        fi
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         ls -la "$out/wire" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         # An empty suite is a result to show, not a reason for this step to fail.
+        # Tolerant on purpose, and newly so: the reuse path lets a run PROCEED when a task's meta is
+        # malformed — it costs the report's labels, not the run — so the step that SUMMARISES that run
+        # must not be the thing that fails on it. A task whose meta cannot be read is listed by its
+        # directory name rather than dropped, because it did ship.
+        #
+        # Written to a file here rather than passed in the environment: this step is driven by tests
+        # that build their own environment, and a step needing a variable they do not know about would
+        # fail for a reason unrelated to what it reports.
+        summarise=$(mktemp)
+        cat > "$summarise" <<'SUMMARISE'
+        import json, pathlib, sys
+        path = pathlib.Path(sys.argv[1])
+        name = path.parent.name
+        try:
+            meta = json.loads(path.read_text())
+        except (OSError, ValueError):
+            meta = None
+        if not isinstance(meta, dict):
+            print(f"- `{name}` — shipped; its meta.json could not be read")
+            sys.exit(0)
+        generated = meta.get("generated")
+        generated = generated if isinstance(generated, dict) else {}
+        names = generated.get("test_names")
+        tests = len(names) if isinstance(names, list) else "?"
+        title = meta.get("title") if isinstance(meta.get("title"), str) else name
+        print(f"- **{title}** — {tests} test(s), validated={generated.get('validated')}")
+        SUMMARISE
         shopt -s nullglob
         count=0
         for meta in "$out"/tasks/*/meta.json; do
-          python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(f\"- **{m['title']}** — {len(m['generated']['test_names'])} test(s), validated={m['generated']['validated']}\")" "$meta" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$summarise" "$meta" >> "$GITHUB_STEP_SUMMARY"
           count=$((count + 1))
         done
         # The runner has already appended the funnel, the first failure of each kind, and what the

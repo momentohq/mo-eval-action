@@ -114,6 +114,51 @@ outside it:
 | `config` | `.mo-eval/config.toml` | The repository's configuration |
 | `out` | runner temp | Where the suite is written; nothing lands in the checkout |
 | `dry-run` | `false` | `"true"` mines and selects, prints the funnel, and runs nothing: a first look at fit in seconds |
+| `repeats` | `1` | How many times to run each arm, so a comparison rests on more than one sample. **1 to 5.** The service **refuses** an over-cap request rather than running fewer — a run recorded as 5 when 9 was asked for would be a different benchmark reported as yours |
+| `repo-name` | this repository | The `owner/name` the suite was mined as — the tenant the service proved its tasks under. Set it only when the config declares an upstream with `repo = "owner/name"`: on a fork that is the upstream, and the checkout's own name would be a different tenant |
+| `reuse-suite` | — | Path to a suite a previous run already mined and validated. Set it to skip mining and validation and only run `arms`. The path must outlive the run that built it — use a **cache**, not this Action's artifact, which carries the task records and not the runnable bundles. Cannot be combined with `dry-run` (there is no mining pass to stop short of) and needs `arms` set |
 
 The runner needs Python 3.11+ (present on GitHub's hosted runners) and `gh` (also present) and
 nothing else. The repository's toolchain must be on `PATH` before this step.
+
+## Running more arms without re-mining
+
+Mining reads merged pull requests and validation runs the repository's own tests once per candidate.
+Changing the model route or the harness changes neither, so a second comparison does not need a
+second suite.
+
+Build once, keeping the suite somewhere that outlives the job. A **cache**, not this Action's
+artifact: the artifact carries the task records for reading (`tasks/`, `wire/`, `funnel.txt`)
+and deliberately not the runnable bundles, so a suite restored from it has no `local-suite/`
+and `reuse-suite` refuses it.
+
+```yaml
+- uses: momentohq/mo-eval-action@v1
+  with:
+    out: ${{ runner.temp }}/mo-eval
+    arms: none            # build and validate, run nothing
+- uses: actions/cache/save@v4
+  with:
+    path: ${{ runner.temp }}/mo-eval
+    key: mo-eval-suite-${{ github.sha }}
+```
+
+Then run as many arm/harness combinations as you like against it:
+
+```yaml
+- uses: actions/cache/restore@v4
+  with:
+    path: ${{ runner.temp }}/mo-eval
+    key: mo-eval-suite-${{ github.sha }}
+- uses: momentohq/mo-eval-action@v1
+  with:
+    reuse-suite: ${{ runner.temp }}/mo-eval
+    arms: momento/zai-org/GLM-5.2
+    harnesses: mo cc
+    repeats: "3"
+```
+
+The bundles are uploaded again on each run — a run names storage keys the service resolves, so the
+transfer is what a run costs. That is the cheap half; what is skipped is the mining and the
+validation. The step summary says which suite was reused, and that nothing was mined, so a reused
+run is never read as a mining pass that found the same thing twice.
