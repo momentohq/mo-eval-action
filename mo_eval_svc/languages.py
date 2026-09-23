@@ -98,8 +98,15 @@ class Language:
     tracked and non-ignored files only, so an ignored `vendor/` silently never reaches the
     workers — and the baseline "fails" on a module fetch instead of on the task."""
     failed_a_test: str = ""
-    """Regex proving the NAMED test ran and FAILED, with `{name}` available. A line pattern, like
-    `ran_a_test`, and matched the same two ways.
+    """Regex that is evidence the NAMED test did not pass, with `{name}` available. A line pattern,
+    like `ran_a_test`, and matched the same two ways.
+
+    Read only alongside two other answers — the command failed, and `ran_a_test` did NOT match — so
+    what it has to carry is the test's IDENTITY, not a verdict. A verdict line is the obvious way to
+    carry one and is what most ecosystems give. It is not the only way: `c` declares gtest's
+    `[ RUN      ]` START line, because a C test that segfaults never reaches a verdict and a
+    contract watching for one would reject the flip. Whatever the line, it must name the test —
+    anything weaker re-admits the case below, where a neighbour failed and this test never ran.
 
     The start state is where a task's claim lives: a test that fails there and passes at the
     reference is the flip the mining looks for. Read from an exit code alone that claim is wrong
@@ -596,6 +603,141 @@ LANGUAGES: dict[str, Language] = {
         # carry no passed/failed count, which is what says the runner reported nothing. Never
         # `Test Suites:`/`Test Files`, which report a failure for a suite that ran nothing.
         runner_reported=r"Tests:?\s.*[0-9]+ (passed|failed)",
+    ),
+    "c": Language(
+        name="c",
+        source_suffixes=(".c", ".h"),
+        # A C project's unit tests are C++ files, because GoogleTest is: valkey's live in
+        # `src/unit/test_*.cpp` and exercise `src/*.c`. The suffixes stay C on purpose — what a
+        # change did to the C is what is graded, and a `.cpp` under the test path is a test by its
+        # path rather than by its extension.
+        # THREE shapes. A gtest file under `src/unit/` is a test by its directory; so is every C
+        # file under a `tests/` tree, which is where a C project keeps the fixtures its integration
+        # suite loads — valkey has fifty `tests/modules/*.c`, and a rule reading only the `.cpp`
+        # shape charges each of them to the implementation half. The suffix is the third, and the
+        # only one not measured here: valkey names its files `test_*.cpp` while Abseil and much of
+        # Google's own C++ names them `*_test.cc`, and a repository of that shape whose tests were
+        # read as implementation would report "change writes no test" for every candidate.
+        #
+        # Deliberately path-led rather than gtest-shaped, and that is load-bearing for the future:
+        # `detect_framework` counts a variant's `test_declaration` over the files the BASE row's
+        # `test_path` selected, so narrowing this to gtest's own spellings would make a Unity or
+        # CMocka variant uncountable before it could be added.
+        #
+        # But SUFFIXED, unlike every other row's bare `(^|/)tests?/`, and that is what C costs.
+        # `is_source_path` is "a source suffix OR this pattern", so a bare directory shape claims a
+        # path whatever its extension, and `change_source` then reads the parent AND child blob of
+        # each one and ships both — which is the saving that predicate exists for. Measured on
+        # valkey: the bare shape claims 690 of 2043 tracked paths and 412 of those are neither C nor
+        # C++ (272 `.tcl`, 66 `.sh`, 19 `.lua`, 12 binary `.rdb`), because a C repository keeps a
+        # large script suite under `tests/` and vendors whole foreign test trees under `deps/`.
+        # Across 300 commits that is ~146 KB per candidate read and sent for files nothing mines —
+        # the Tcl suite is not gradeable today, so a candidate carrying only those is rejected
+        # downstream for writing no test, after the bytes have already crossed.
+        test_path=_pattern(r"(^|/)(unit|tests?)/.*\.(c|h|cpp|cc|cxx|hpp)$|_tests?\.(cpp|cc|cxx)$"),
+        test_declaration=_pattern(r"^\s*TEST(?:_F|_P)?\s*\("),
+        # A gtest test's identity is `Suite.Name`: two arguments of one macro, where this table can
+        # carry exactly one captured group. The METHOD half is the one that is nearly unique —
+        # measured over valkey's 897 tests, one method name is shared with another suite — so the
+        # filter below re-attaches the suite with a `*` and the proof carries the whole identity.
+        test_name=_pattern(r"TEST(?:_[FP])?\s*\(\s*\w+\s*,\s*(\w+)\s*\)"),
+        inline_tests=False,
+        # A skeleton rather than a command, because C has no ecosystem-wide one: there is no
+        # `go test` here, and what builds a C project is the project's. Two parts of the shape are
+        # the contract's, though, and both are load-bearing — which is why this is not left empty.
+        #
+        # The BUILD is inside it. An additive change's start state is a tree that does not compile,
+        # and a build moved into `setup_command` reports that as an environment that could not be
+        # prepared rather than as the task.
+        #
+        # And it is an `sh -c '…' $0`, not a script in the repository. A workspace is an export of
+        # the candidate's PARENT commit and nothing overlays `.mo-eval/` into it, so a wrapper
+        # committed on HEAD is absent and every order is refused with `[Errno 2] No such file or
+        # directory` (#4568). SINGLE-quoted: the generated scorer pastes this into a bash script
+        # verbatim (`service/build.py::_ACCEPTANCE_SCRIPT`), so a double-quoted body would have THAT
+        # shell expand `$(…)` and `"$@"` before `sh` saw them, while the probe path — which execs
+        # with no shell at all — would be unaffected. The probe's filter arrives as `"$@"` and
+        # cannot reach the script text, which is what keeps the declaration an allow-list.
+        test_command="sh -c 'set -e; make; exec ./build/unit-tests \"$@\"' mo-eval",
+        # `--gtest_color=no` first, and from the contract rather than the repository: gtest colours
+        # its own report when it believes it is being watched, and the escape lands INSIDE the
+        # brackets — `\x1b[0;31m[  FAILED  ] \x1b[m` — where no line pattern below can see it.
+        # Measured: `make test-unit` (which runs the binary under `gtest-parallel`) prints exactly
+        # that, and the same binary run directly prints none.
+        #
+        # `*.` because the name is the method half. It is a glob, not a substring: gtest matches a
+        # filter against the WHOLE `Suite.Name`, so `*.ParseSubnetIpv4` cannot also select
+        # `ParseSubnetIpv4Extra` the way an unanchored substring would — only another suite's
+        # identically named method, which the proof then separates.
+        #
+        # Nothing in `{name}` can be a filter metacharacter: `test_name` captures `(\w+)`, and
+        # gtest reads `*`, `?`, `:` and a leading `-` (negation). `_fills` refuses a leading `-`
+        # independently.
+        #
+        # A PARAMETERIZED test is not selectable and is not meant to be. `TEST_P` instantiates as
+        # `Prefix/Suite.Method/0`, which `*.Method` does not match — measured, the filter selects
+        # zero tests — so its probe proves nothing and the candidate is refused at validation
+        # rather than graded. Selecting it would need `:*.{name}/*` in the filter AND a proof that
+        # tolerates the `/0` suffix; with only the first, tests would run and prove nothing, which
+        # is worse. valkey has 7 such instantiations against 897 tests.
+        filter_template="--gtest_color=no --gtest_filter=*.{name}",
+        # `[       OK ] AnetSubnetTest.ParseSubnetIpv4 (0 ms)`. Load-bearing, not decoration: a
+        # filter matching nothing exits ZERO, printing `[==========] 0 tests from 0 test suites
+        # ran.` — so an oracle reading the exit code alone would grade a task that cannot be failed.
+        #
+        # `( \(|$)` rather than a bare `\(`, because the duration is OPTIONAL: a repository
+        # declaring `--gtest_print_time=0` prints `[       OK ] ExampleTest.TestAssertions` with
+        # nothing after it (measured), and a pattern demanding the duration reports that a test
+        # which plainly passed never ran — rejecting every task in the repository for a reporter
+        # flag. The alternation still refuses a longer neighbour: after `{name}` in
+        # `…] Suite.NameExtra (0 ms)` comes `E`, which is neither a space nor the end of the line.
+        ran_a_test=r"^\[\s+OK\s+\] \S+\.{name}( \(|$)",
+        # The START of the test, not gtest's `[  FAILED  ]` line — because in C a failing test
+        # very often does not reach one. Measured on valkey-io/valkey#4312, whose task is a signed-overflow
+        # fix: at the start state the test SEGFAULTS, gtest's last output is `[ RUN      ]
+        # VsetTest.TestVsetLargeExpiryBucketOverflow` and the command exits 139. A pattern over
+        # `[  FAILED  ]` sees nothing there and rejects a flip that is exactly the one mining looks
+        # for — and a crash is the normal shape of a C bug's test, not an edge case.
+        #
+        # Sound because of the three things `_failed_a_test` requires together: the command failed,
+        # THIS pattern appeared, and `ran_a_test` did NOT. A test that started and did not pass, on
+        # a command that failed, failed — whether it printed a verdict, crashed, or was killed. The
+        # `$` is what stops `…] Suite.NameExtra` satisfying it, and an assertion failure satisfies
+        # it too, since gtest prints `[ RUN      ]` before the test body either way.
+        #
+        # A compile failure has no `[ RUN      ]` line at all, which is the case this cannot admit
+        # and `build_failed_at` below would — see there.
+        failed_a_test=r"^\[\s+RUN\s+\] \S+\.{name}$",
+        # `[==========] 1 test from 1 test suite ran. (0 ms total)` — printed for zero tests too,
+        # and never printed at all when the build failed before the binary existed. That is the
+        # question this answers: did the runner get as far as reporting.
+        runner_reported=r"^\[==========\] [0-9]+ tests? from [0-9]+ test suites? ran\.",
+        # The same colour suppression as `filter_template`, by the OTHER lever, because the flag
+        # reaches only the renderings that append a filter. `Oracle.runnable_test_command` appends
+        # none — it is the whole-suite command the conventions judge and the lane's litter probe
+        # run — so without this those two read a coloured report with no pattern able to see it.
+        # The scorer already treats colour as a general hazard and exports `NO_COLOR`/`FORCE_COLOR`
+        # for Vitest; gtest reads neither.
+        #
+        # Measured, with a real pty and `TERM` set, because without either gtest does not colour at
+        # all and every answer looks the same: unset it colours, `GTEST_COLOR=no` suppresses,
+        # `--gtest_color=no` suppresses, and `--gtest_color=yes` BEATS `GTEST_COLOR=no` — which is
+        # why the flag is declared too rather than this replacing it.
+        scorer_preamble="export GTEST_COLOR=no",
+        # No `build_failed_at`/`build_failed_summary`, and not for want of measuring. gcc's wording
+        # is `test_sds.cpp:709:18: error: 'x' was not declared in this scope` and make's is
+        # `make: *** [Makefile:226: test_sds.o] Error 1`, but neither path resolves. gcc spells it
+        # relative to the directory make compiled in (`src/unit`) and ld spells it absolute, while
+        # `_compiler_refusals` joins what it captures to `workspace_root` — `.` for every contract
+        # that is not package scoped. Nothing matches a scaffolded path, and the rule then refuses
+        # exactly the tasks it exists to admit.
+        #
+        # So an additive C change is not mined: its scaffolded test cannot compile, this contract's
+        # `failed_a_test` needs a `[ RUN      ]` line the binary never printed, and `_failed_a_test`
+        # reads the exit code only when `counterproof_seen is None`, which the runner sets only for
+        # a contract carrying no counterproof at all. `judge` refuses it as a graded test that did
+        # not run. Measured: three of four valkey validation orders ended there, every one a link
+        # error. #4567 carries the fix.
     ),
     "csharp": Language(
         name="csharp",

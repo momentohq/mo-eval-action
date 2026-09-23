@@ -744,20 +744,27 @@ def bounded_text(path: Path) -> str | None:
         return None
 
 
-def _blob(repo: Path, commit: str, path: str) -> str | None:
-    """Return a file's content at `commit`, or `None` when absent or too large to send.
+def _blob(repo: Path, commit: str, path: str) -> tuple[str | None, bool]:
+    """A file's content at `commit`, and whether a `None` means too large rather than absent.
+
+    The two reasons for having no content are not the same fact and must not arrive as the same
+    value: a file that did not exist at the parent is an ADD, while one this runner declined to read
+    is a file the service knows nothing about. Collapsed into a bare `None`, the second reads as the
+    first — or, on the child side, as a deletion, which is what the service reported for valkey's
+    684 KB `src/module.c`.
 
     Returns:
-        The file content at the commit, or `None` when the object is absent or exceeds the size
-        cap.
+        The content and `False` when it was read, or `None` and whether the object exists but
+        exceeds the size cap.
     """
     try:
         size = _git(repo, "cat-file", "-s", f"{commit}:{path}").strip()
     except subprocess.CalledProcessError:
-        return None
+        # No such object at that commit: the file genuinely was not there.
+        return None, False
     if int(size) > _MAX_FILE_BYTES:
-        return None
-    return _git(repo, "show", f"{commit}:{path}")
+        return None, True
+    return _git(repo, "show", f"{commit}:{path}"), False
 
 
 def _prose(repo: Path, change_id: str) -> dict[str, str]:
@@ -835,15 +842,21 @@ def change_source(
     sources: list[ChangeSource] = []
     for change_id in change_ids:
         change = by_id[change_id]
-        files = [
-            FileSource(
-                path=file.path,
-                parent_content=_blob(repo, change.parent, file.path),
-                child_content=_blob(repo, change_id, file.path),
+        files = []
+        for file in change.files:
+            if not is_source_path(file.path, language):
+                continue
+            parent_content, parent_oversized = _blob(repo, change.parent, file.path)
+            child_content, child_oversized = _blob(repo, change_id, file.path)
+            files.append(
+                FileSource(
+                    path=file.path,
+                    parent_content=parent_content,
+                    parent_oversized=parent_oversized,
+                    child_content=child_content,
+                    child_oversized=child_oversized,
+                )
             )
-            for file in change.files
-            if is_source_path(file.path, language)
-        ]
         sources.append(ChangeSource(change_id=change_id, files=files, prose=_prose(repo, change_id)))
     return sources
 

@@ -172,9 +172,22 @@ class FileSource:
 
     path: str
     parent_content: str | None
-    """Content at the parent commit, or `None` when the change added the file."""
+    """Content at the parent commit, or `None` when the change added the file — or when it was
+    withheld, which `parent_oversized` is how to tell apart."""
     child_content: str | None
-    """Content after the change, or `None` when the change deleted it."""
+    """Content after the change, or `None` when the change deleted it — or when it was too large to send."""
+    parent_oversized: bool = False
+    """Whether `parent_content` is `None` because the object exceeds the runner's file-size cap,
+    rather than because the file did not exist at the parent.
+
+    A runner caps how large a file it reads, and an absent value and a capped one are the same
+    `None` on the wire. Read as absence, a capped side makes the diff look like the whole file was
+    added; read as deletion, it makes the change look like one the scaffold cannot express — which
+    is what `split` reported for valkey's 684 KB `src/module.c`, naming a deletion that never
+    happened. Defaults to `False`, so a runner predating this field describes exactly what it did
+    before: nothing capped, because it had no way to say so."""
+    child_oversized: bool = False
+    """The same for `child_content`."""
 
 
 @dataclass(frozen=True)
@@ -642,7 +655,7 @@ def event_cost(text: str) -> int:
     return len(json.dumps(text)) - 2
 
 
-PROTOCOL = 5
+PROTOCOL = 6
 """The revision of this protocol the copy of these types in THIS tree speaks.
 
 Sent by the runner as `RepoFacts.protocol` so the service knows which fields it may put in an order.
@@ -658,6 +671,9 @@ is the number that shipped with it.
    Declared rather than fixed — the number buys nothing here, because a runner never asks for that
    response. The Action vendors this whole file, so its surface moved even though nothing it decodes
    did, and the gate compares the surface rather than guessing at use.
+6. `FileSource.parent_oversized` and `FileSource.child_oversized`: whether a side's `None` means the
+   runner declined to send the content rather than the file not existing. Both default to `False`,
+   so an older runner's payload decodes unchanged and describes what it actually did.
 4. `RepositorySummary` and `RepositoriesResponse`: the chooser's read, so a signed-in viewer can be
    shown which repositories they may open rather than having to name one. Declared for the same
    reason as 3 and with the same caveat — these cross between the BFF and a browser, so a runner
