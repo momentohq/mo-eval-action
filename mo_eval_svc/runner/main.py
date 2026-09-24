@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import logging
 import os
 import posixpath
 import re
@@ -75,6 +76,25 @@ from mo_eval_svc.wire import (
     Wire,
     WorkOrder,
 )
+
+_LOGGER = logging.getLogger(__name__)
+"""Runner progress events. Entrypoints choose their rendering without coupling the runner to one."""
+
+LoggingConfigurator = Callable[[bool], None]
+"""Configures the CLI's logging handler for whether detailed output was requested."""
+
+
+def configure_plain_logging(verbose: bool) -> None:
+    """Configure concise standard-library progress logging for the vendored runner entrypoint.
+
+    Args:
+        verbose: Whether diagnostic progress should be included.
+    """
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(message)s",
+        force=True,
+    )
 
 
 def _safe_relative(name: str, into: Path) -> Path:
@@ -289,6 +309,7 @@ def _build_local_suite(
     _break_hard_links(root)
     _write_all(package.local_suite, root, "local suite")
     _bounded([*git, "add", "-A"], cwd=root)
+    _stage_what_the_commit_carried(repo, commit_or_refuse(meta["parent_commit"]), root, git)
     for artifact in _offline_artifacts(meta, config):
         _require_within(root, artifact)
         if not (root / artifact).exists():
@@ -321,6 +342,7 @@ def _build_local_suite(
     # AFTER the commit, deliberately: running a scorer leaves build artifacts, and the `add -A`
     # above would have frozen them into the start tree — the same defect #4128 fixed for capture.
     # The tree is restored to the committed state afterwards, so what ships is what was committed.
+    #
     _refuse_a_task_its_own_image_cannot_score(root, meta, config)
     return root
 
@@ -355,6 +377,77 @@ class _PrepareCommand(Protocol):
     def __call__(self, argv: list[str], *, cwd: Path, timeout: float, env: dict[str, str] | None) -> None: ...
 
 
+def _stage_what_the_commit_carried(repo: Path, commit: str, root: Path, git: list[str]) -> None:
+    """Stage the exported commit's own files, past any ignore rule that would drop them.
+
+    `git add -A` above re-decides what belongs from scratch, in a repository initialized moments
+    ago where every file is untracked — so a `.gitignore` inside the exported tree applies to files
+    that were tracked in the commit it came from. Git itself never does this: an ignore rule has no
+    authority over a tracked file, which is why the file is in the commit at all.
+
+    Unstaged, the file survives just long enough to be misleading: the score check runs against the
+    working tree and passes, and `_restore_to_the_commit`'s `git clean -qfdx` then deletes it, so
+    the bundle ships without it. Measured on valkey, whose vendored jemalloc carries a `.gitignore`
+    excluding the generated `configure` that valkey commits anyway — five files vanished, the worker
+    answered `./configure: not found`, no C task from the repository could be scored, and every one
+    of them had validated.
+
+    Scoped to what the commit carried rather than a blanket `add -f`: everything else in the tree is
+    the preparation's output, and the ignore rules are how a vendoring step's incidental build
+    artifacts stay out of the bundle. What a repository declares in `offline_artifacts` is forced in
+    separately, for that reason.
+
+    Three details are load-bearing, each measured rather than reasoned:
+
+    - **`:(literal)`**. A pathspec is a glob, and `--` disables option parsing, not pathspec magic.
+      A committed `pages/[id].tsx` — the ordinary spelling of a dynamic route, so this is common in
+      JavaScript repositories — is a bracket expression that also matches a neighbouring `i.tsx`,
+      and force-adds it past the very ignore rule that was keeping it out.
+    - **Raw bytes**. A path on Linux is bytes, not text, and `text=True` decodes them as strict
+      UTF-8; one `caf\xe9.txt` in a commit raises `UnicodeDecodeError`, which is a `ValueError`, so
+      packaging reports "bundle was not created" for EVERY task of that repository.
+    - **Not a directory**. `git add -f` on a directory recurses past every ignore rule beneath it.
+      The path is a blob in the commit, so a directory there means the preparation replaced it —
+      and a submodule's gitlink exports as an empty directory that `ls-tree -r` names.
+
+    Raises:
+        OrderError: If the commit's file list cannot be read, or the paths cannot be staged.
+    """
+    listed = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "-z", commit],
+        cwd=repo,
+        capture_output=True,
+        timeout=_GIT_SECONDS,
+    )
+    if listed.returncode != 0:
+        detail = listed.stderr.decode("utf-8", "replace").strip()
+        raise OrderError(f"could not list the files of {commit}: {detail}")
+    carried = []
+    for raw in listed.stdout.split(b"\0"):
+        if not raw:
+            continue
+        where = root / os.fsdecode(raw)
+        # `lexists`, so a symlink is judged as itself. A path the scaffold deleted is simply absent,
+        # and not an error: the commit says what EXISTED, not what survived the scaffold.
+        if not os.path.lexists(where) or (where.is_dir() and not where.is_symlink()):
+            continue
+        carried.append(b":(literal)" + raw)
+    if not carried:
+        return
+    # Through stdin rather than argv: the list is a whole repository's worth of paths, and this has
+    # no length to exceed and so needs no batching to get wrong.
+    staged = subprocess.run(
+        [*git, "add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        cwd=root,
+        input=b"\0".join(carried) + b"\0",
+        capture_output=True,
+        timeout=_GIT_SECONDS,
+    )
+    if staged.returncode != 0:
+        detail = staged.stderr.decode("utf-8", "replace").strip()
+        raise OrderError(f"could not stage the files {commit} carried: {detail}")
+
+
 def _refuse_a_task_its_own_image_cannot_score(
     root: Path, meta: dict[str, JSONAny], config: RunnerConfig | None, run: _ScoreCommand | None = None
 ) -> None:
@@ -384,6 +477,11 @@ def _refuse_a_task_its_own_image_cannot_score(
     if not image:
         # Nothing to disagree with: a repository that declares no image is scored wherever a worker
         # happens to run, and this check has no second environment to compare against.
+        #
+        # Returning BEFORE the restore below is what makes the restore this function's own and not
+        # the caller's: `git clean -qfdx` prunes the bundle, and on this path nothing would look at
+        # what it pruned. Hoisted into the caller it silently dropped a scaffolded test matching an
+        # ignore rule, and the `local-suite` overlay under a repository ignoring `.mo-eval/`.
         return
     if shutil.which("docker") is None:
         # The same refusal `_prepare_offline` makes, for the same reason: skipping the comparison
@@ -400,6 +498,17 @@ def _refuse_a_task_its_own_image_cannot_score(
             raise OrderError("cannot prepare offline scoring for an unknown language contract")
         steps.append(offline_setup(setup, contract))
     steps.append(f"bash {shlex.quote(SCORER_IN_TREE)}")
+    # Restored BEFORE the check as well as after, so it reads the tree that SHIPS rather than the
+    # one that happens to be on disk. The two differ by whatever the export and the preparation left
+    # unstaged, and the difference is not academic: valkey's `deps/jemalloc/configure` was present
+    # while the check ran — so it passed — and removed by the restore afterwards, so every worker
+    # then answered `./configure: not found`. A guard that reads a richer tree than it blesses
+    # cannot see the failure it exists for.
+    #
+    # Here rather than at the top of this function: everything above refuses on what the task
+    # DECLARES, and those refusals must read the same whether or not `root` is a git tree at all.
+    # Restoring first turned an unknown-contract refusal into `not a git repository`.
+    _restore_to_the_commit(root)
     container = f"mo-eval-score-check-{os.getpid()}-{root.name}"
     try:
         exit_code, tail, _, _ = run(
@@ -1100,12 +1209,14 @@ def issue_orders(
     Returns:
         Combined work orders and rejection counts, including changes too large to send.
     """
+    _LOGGER.info("Creating validation orders from %d selected change(s)", len(sources))
     planned = plan_order_requests(facts, sources, candidates)
     for change_id, cost in planned.oversized.items():
-        print(
-            f"  {change_id[:9]} not asked about: its source costs {cost:,} bytes, and one request "
-            f"to the service carries {REQUEST_BUDGET_BYTES:,}",
-            file=sys.stderr,
+        _LOGGER.warning(
+            "%s was not asked about: its source costs %d bytes, and one request carries %d",
+            change_id[:9],
+            cost,
+            REQUEST_BUDGET_BYTES,
         )
     orders: list[WorkOrder] = []
     counts: Counter[str] = Counter()
@@ -1161,28 +1272,28 @@ def suite_exit(*, written: int, shipped: int, asked_to_run: bool) -> int:
 
 def suite(arguments: argparse.Namespace) -> int:
     repo = arguments.repo.resolve()
+    out = (arguments.out if arguments.out is not None else repo / ".mo-eval" / "out").resolve()
+    _LOGGER.debug("Resolving repository and configuration from %s", repo)
     # Before anything can fail: `--out` may be reused, and a funnel record left by the previous
     # run would tell the Action's summary step that this run reported one.
-    (arguments.out.resolve() / FUNNEL_RECORD).unlink(missing_ok=True)
+    (out / FUNNEL_RECORD).unlink(missing_ok=True)
     try:
         config = load_config(repo / arguments.config)
     except ConfigError as failure:
-        print(f"config: {failure}", file=sys.stderr)
+        _LOGGER.error("Configuration failed: %s", failure)
         return 2
     environment, missing = probe_environment(config, os.environ)
     if missing:
-        print(
-            f"config: forward_env names {missing} but the environment does not have them; "
-            f"probes needing them will fail identically",
-            file=sys.stderr,
+        _LOGGER.warning(
+            "Configuration names missing environment variables %s; probes needing them will fail identically",
+            missing,
         )
     try:
         client = client_for(arguments.service, arguments.token or os.environ.get("MO_EVAL_TOKEN"))
     except ServiceError as failure:
-        print(f"service: {failure}", file=sys.stderr)
+        _LOGGER.error("Service setup failed: %s", failure)
         return 2
 
-    out = arguments.out.resolve()
     # Before anything is written into it. `_package_each_verdict` creates `tasks/` and
     # `local-suite/` well before a hand-off could look at them, so a PRE-EXISTING link at either
     # door would put this run's output outside `--out` and the refusal would come too late to
@@ -1190,38 +1301,43 @@ def suite(arguments: argparse.Namespace) -> int:
     try:
         refuse_a_linked_tree(out)
     except OrderError as failure:
-        print(f"config: {failure}", file=sys.stderr)
+        _LOGGER.error("Configuration failed: %s", failure)
         return 2
     wire = Wire(root=out / "wire")
     contract = _contract_name(repo, config.language, config.test_command)
     name = _repo_name(repo, config.repo)
-    print(f"mo-eval-runner · {name} · {contract}")
+    _LOGGER.info("mo-eval-runner · %s · %s", name, contract)
 
+    branch = arguments.branch or _branch(repo, name)
+    _LOGGER.info("Collecting merged changes from %s", branch)
     facts = repo_facts(
         repo,
         repo_name=name,
         language=contract,
         test_command=config.test_command,
-        branch=arguments.branch or _branch(repo, name),
+        branch=branch,
         limit=arguments.history,
         language_contract=LANGUAGES[config.language],
         setup_command=config.setup_command,
     )
+    _LOGGER.debug("Collected %d merged change(s) via %s", len(facts.changes), facts.source)
     # Recorded after the declaration is folded in, so the audit holds what was sent rather than an
     # earlier version of it.
     facts = wire.crossing("up", "repo-facts", replace(facts, worker_image=config.worker_image))
     try:
+        _LOGGER.info("Selecting up to %d candidate change(s)", arguments.candidates)
         request = wire.crossing("down", "source-request", client.select(facts, arguments.candidates))
         request = replace(request, change_ids=asked_for(request.change_ids, facts, arguments.candidates))
+        _LOGGER.debug("Selection retained %d change(s)", len(request.change_ids))
         sources = change_source(repo, facts, request.change_ids, resolve_contract(contract))
         response = issue_orders(client, wire, facts, sources, arguments.candidates)
     except ServiceError as failure:
-        print(f"service: {failure}", file=sys.stderr)
+        _LOGGER.error("Selection or order creation failed: %s", failure)
         return 1
 
     orders = response.orders[: arguments.validate] if arguments.validate else response.orders
     if arguments.dry_run:
-        print(f"  --dry-run: {len(orders)} order(s) issued, none run")
+        _LOGGER.info("Dry run: %d order(s) would be validated", len(orders))
         _funnel(
             facts,
             request,
@@ -1232,6 +1348,7 @@ def suite(arguments: argparse.Namespace) -> int:
             dry_run=True,
             record=out / FUNNEL_RECORD,
         )
+        _report_written_outputs(out)
         return 0
     runner = Runner(
         repo=repo,
@@ -1248,14 +1365,14 @@ def suite(arguments: argparse.Namespace) -> int:
         filter_template=resolve_contract(contract).filter_template,
     )
     results = []
-    for order in orders:
-        print(f"  running {order.order_id} …", flush=True)
+    for index, order in enumerate(orders, start=1):
+        _LOGGER.info("Validating order %d/%d: %s", index, len(orders), order.order_id)
         results.append(runner.run(order))
     wire.crossing("up", "order-results", results)
     try:
         report = verdicts_asked_for(wire.crossing("down", "verdicts", client.verdicts(results)), len(results))
     except ServiceError as failure:
-        print(f"service: {failure}", file=sys.stderr)
+        _LOGGER.error("Validation verdict request failed: %s", failure)
         return 1
 
     written: list[Path] = []
@@ -1264,6 +1381,7 @@ def suite(arguments: argparse.Namespace) -> int:
     # task's tree would be frozen into the start state and shipped to every worker.
     prepare_cache = out / ".prepare-cache"
     prepare_cache.mkdir(parents=True, exist_ok=True)
+    _LOGGER.info("Packaging %d validation verdict(s)", len(report.verdicts))
     packaged, refusals = _package_each_verdict(report, repo, out, config, prepare_cache, written)
     # Before hand-off, which is where disk peaks: it holds every tree AND every archive at once.
     _discard_the_preparation_cache(prepare_cache)
@@ -1282,6 +1400,8 @@ def suite(arguments: argparse.Namespace) -> int:
     )
     shipped = 0
     if written and arguments.run:
+        _LOGGER.info("Preparing hosted handoff for %d validated task(s)", len(written))
+        _LOGGER.debug("Requested routes: %s", ", ".join(arguments.run))
         conventions = _conventions(repo, facts.repo, min(arguments.history, 120))
         try:
             shipped = _hand_off(
@@ -1297,17 +1417,19 @@ def suite(arguments: argparse.Namespace) -> int:
         except ServiceError as failure:
             # The validated tasks are already on disk, so this is recoverable: the same hand-off is
             # what `submit --out <dir>` does. Reported as a message and an exit code, not a traceback.
-            print(f"service: {failure}", file=sys.stderr)
-            print(
-                f"the validated tasks are in {out}; retry the hand-off with `submit --out {out}`",
-                file=sys.stderr,
+            _LOGGER.error(
+                "Hosted handoff failed: %s. The validated tasks are in %s; retry with `submit --out %s`",
+                failure,
+                out,
+                out,
             )
+            _report_written_outputs(out)
             return 1
         if not shipped:
-            print(
-                f"  {len(written)} task(s) validated, but no bundle was handed off; nothing is running",
-                file=sys.stderr,
+            _LOGGER.warning(
+                "%d task(s) validated, but no bundle was handed off; nothing is running", len(written)
             )
+    _report_written_outputs(out)
     return suite_exit(written=len(written), shipped=shipped, asked_to_run=bool(arguments.run))
 
 
@@ -1322,6 +1444,7 @@ def submit(arguments: argparse.Namespace) -> int:
     """
     out = Path(arguments.out)
     repo_name = arguments.repo_name
+    _LOGGER.info("Preparing hosted handoff from %s", arguments.out)
     conventions = None
     if arguments.conventions_from is not None:
         conventions = _conventions(Path(arguments.conventions_from), repo_name, arguments.history)
@@ -1339,18 +1462,18 @@ def submit(arguments: argparse.Namespace) -> int:
     except ServiceError as failure:
         # Reported the way `suite` reports it: a named service that cannot be reached is a message
         # and an exit code, not a traceback.
-        print(f"service: {failure}", file=sys.stderr)
+        _LOGGER.error("Hosted handoff failed: %s", failure)
         return 2
     except OrderError as failure:
         # `_hand_off` refuses a tree it will not read — a symlinked `local-suite`. On THIS path that
         # tree is the caller's, so the refusal is reachable, and reaching it must cost an exit code
         # rather than a traceback like every other refusal here.
-        print(f"submit: {failure}", file=sys.stderr)
+        _LOGGER.error("Hosted handoff failed: %s", failure)
         return 2
     if not shipped:
         # `suite`'s code for "nothing survived". A hand-off that shipped no bundle recorded no run,
         # so reporting success would tell a workflow its arms are running when nothing is.
-        print(f"submit: {out} handed off no bundle; nothing is running", file=sys.stderr)
+        _LOGGER.error("%s handed off no bundle; nothing is running", out)
         return 3
     return 0
 
@@ -1371,9 +1494,11 @@ def _conventions(repo: Path, repo_name: str, history: int) -> ConventionSources:
     numbers = _recent_merged(repo, repo_name, history)
     comments = [ReviewComment(**c) for c in review_comments(repo, repo_name, numbers)]
     files = convention_files(repo)
-    print(
-        f"  conventions: {len(files)} file(s), {len(comments)} review comment(s) "
-        f"from {len(numbers)} merged PRs"
+    _LOGGER.info(
+        "Collected %d convention file(s) and %d review comment(s) from %d merged PRs",
+        len(files),
+        len(comments),
+        len(numbers),
     )
     return ConventionSources(files=files, comments=comments)
 
@@ -1500,18 +1625,21 @@ def _hand_off(
             that tree is the caller's, and a link there would have every bundle tarred through it.
     """
 
+    _LOGGER.info("Preparing archives for hosted handoff")
     bundles = confined_bundles(out)
     if not bundles:
         if refusals:
             # Not a guess. A suite whose every bundle was refused HAS a worker image — refusing is
             # what that image just did — and telling the customer to check whether they declared one
             # sends them to the one place the answer is not.
-            print(
-                f"  nothing to hand off: all {len(refusals)} bundle(s) were refused before shipping; "
-                f"see the refusals above"
+            _LOGGER.warning(
+                "Nothing to hand off: all %d bundle(s) were refused before shipping; see the refusals above",
+                len(refusals),
             )
         else:
-            print("  nothing to hand off: no local-suite bundles (does the config declare worker_image?)")
+            _LOGGER.warning(
+                "Nothing to hand off: no local-suite bundles (does the config declare worker_image?)"
+            )
         return 0
     # A bundle whose build failed is still a DIRECTORY: `write_local_suite` creates the root, exports
     # the start tree into it, and only then lays the overlay over it — so a failure in between leaves
@@ -1522,19 +1650,16 @@ def _hand_off(
     # claim. Checked here rather than in `suite` so `submit --out <dir>` is covered by the same rule.
     unscoreable = [bundle.name for bundle in bundles if not (bundle / _SUITE_MANIFEST).is_file()]
     if unscoreable:
-        print(
-            f"  not handing off {len(unscoreable)} bundle(s) with no {_SUITE_MANIFEST}: "
-            f"{', '.join(unscoreable)}",
-            file=sys.stderr,
-        )
-        print(
-            "  their tasks are still valid and still runnable with `--service local`; the bundle "
-            "build is what failed, above.",
-            file=sys.stderr,
+        _LOGGER.warning(
+            "Not handing off %d bundle(s) with no %s: %s. Their tasks remain runnable with "
+            "`--service local`; bundle building failed above.",
+            len(unscoreable),
+            _SUITE_MANIFEST,
+            ", ".join(unscoreable),
         )
         bundles = [bundle for bundle in bundles if bundle.name not in set(unscoreable)]
     if not bundles:
-        print("  nothing to hand off: no bundle carries a suite to score", file=sys.stderr)
+        _LOGGER.warning("Nothing to hand off: no bundle carries a suite to score")
         return 0
     task_ids = [p.name for p in bundles]
     suite_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{task_ids[0][-8:]}"
@@ -1550,10 +1675,11 @@ def _hand_off(
             with tarfile.open(archives[bundle.name], mode="w:gz") as tar:
                 tar.add(bundle, arcname=bundle.name)
         archive_sizes = {name: archive.stat().st_size for name, archive in archives.items()}
+        _LOGGER.info("Requesting upload targets for %d bundle(s)", len(task_ids))
         targets = client.uploads(
             UploadRequest(repo=repo_name, suite_id=suite_id, task_ids=task_ids, sizes=archive_sizes)
         )
-        print(f"\n  uploading {len(task_ids)} bundle(s) for suite {suite_id}")
+        _LOGGER.info("Uploading %d bundle(s) for suite %s", len(task_ids), suite_id)
         for name, archive in archives.items():
             url = targets.urls[name]
             if url.startswith("file://"):
@@ -1582,7 +1708,7 @@ def _hand_off(
                         raise ServiceError(
                             f"uploading {name}: {getattr(failure, 'reason', failure)}"
                         ) from failure
-            print(f"    {name}  {archive_sizes[name] / 1e6:.1f} MB")
+            _LOGGER.info("Uploaded bundle %s (%.1f MB)", name, archive_sizes[name] / 1e6)
     finally:
         for archive in archives.values():
             archive.unlink(missing_ok=True)
@@ -1593,7 +1719,7 @@ def _hand_off(
         try:
             meta = _safe_relative(f"tasks/{task_id}/meta.json", out)
         except ValueError as failure:
-            print(f"  {task_id}: {failure}; its labels are omitted", file=sys.stderr)
+            _LOGGER.warning("%s: %s; its labels are omitted", task_id, failure)
             continue
         if not meta.is_file():
             continue
@@ -1604,10 +1730,10 @@ def _hand_off(
         try:
             record = json.loads(meta.read_text())
         except (OSError, ValueError) as failure:
-            print(f"  {task_id}: meta.json unreadable ({failure}); its labels are omitted", file=sys.stderr)
+            _LOGGER.warning("%s: meta.json unreadable (%s); its labels are omitted", task_id, failure)
             continue
         if not isinstance(record, dict):
-            print(f"  {task_id}: meta.json is not an object; its labels are omitted", file=sys.stderr)
+            _LOGGER.warning("%s: meta.json is not an object; its labels are omitted", task_id)
             continue
         title = record.get("title")
         titles[task_id] = title if isinstance(title, str) else ""
@@ -1625,6 +1751,7 @@ def _hand_off(
             sizes[task_id] = size
     # No harness named stays unnamed all the way to the service, which is what decides what that
     # means — rather than a default here to drift from it, or a key in a request that predates it.
+    _LOGGER.info("Recording hosted run")
     ticket = client.runs(
         RunRequest(
             repo=repo_name,
@@ -1639,9 +1766,11 @@ def _hand_off(
             harnesses=harnesses,
         )
     )
-    print(
-        f"  run {ticket.run_id} recorded ({ticket.job_key}); "
-        f"results will appear under {ticket.results_prefix}"
+    _LOGGER.info(
+        "Recorded run %s (%s); results will appear under %s",
+        ticket.run_id,
+        ticket.job_key,
+        ticket.results_prefix,
     )
     return len(task_ids)
 
@@ -1681,7 +1810,7 @@ def _package_each_verdict(
     refusals: list[str] = []
     for verdict in report.verdicts:
         mark = "VALIDATED" if verdict.validated else "rejected "
-        print(f"  {mark} {verdict.change_id[:9]}  {verdict.detail}")
+        _LOGGER.info("%s %s: %s", mark, verdict.change_id[:9], verdict.detail)
         if verdict.task is None:
             continue
         written.append(write_package(verdict.task, out / "tasks"))
@@ -1692,12 +1821,12 @@ def _package_each_verdict(
             # could not be built, and one task's bundle failing is not the suite's end. Counted as
             # well as printed: stderr is not where a customer reads whether their suite worked, and
             # a green run reporting `validated N of N` while shipping nothing is what this records.
-            print(f"             local-suite bundle failed: {failure}", file=sys.stderr)
+            _LOGGER.warning("Bundle for %s was not created: %s", verdict.task.task_id, failure)
             refusals.append(str(failure))
             continue
         if bundle is not None:
             packaged.append(bundle)
-            print(f"             local-suite bundle → {bundle}")
+            _LOGGER.info("Bundle for %s is ready at %s", verdict.task.task_id, bundle)
     return packaged, refusals
 
 
@@ -1782,6 +1911,32 @@ def _funnel(
     if record is not None:
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text(block, encoding="utf-8")
+
+
+def _report_written_outputs(out: Path) -> None:
+    """Report the artifact categories produced by a completed suite command."""
+    artifacts: list[str] = []
+    wire_directory = out / "wire"
+    wire_records = sorted(wire_directory.glob("*.json")) if wire_directory.is_dir() else []
+    if wire_records:
+        artifacts.append(f"protocol records ({len(wire_records)}): {wire_directory}")
+    funnel = out / FUNNEL_RECORD
+    if funnel.is_file():
+        artifacts.append(f"funnel report: {funnel}")
+    tasks_directory = out / "tasks"
+    task_count = sum(path.is_dir() for path in tasks_directory.iterdir()) if tasks_directory.is_dir() else 0
+    if task_count:
+        artifacts.append(f"validated task packages ({task_count}): {tasks_directory}")
+    bundles_directory = out / "local-suite"
+    bundle_count = (
+        sum(path.is_dir() for path in bundles_directory.iterdir()) if bundles_directory.is_dir() else 0
+    )
+    if bundle_count:
+        artifacts.append(f"runnable task bundles ({bundle_count}): {bundles_directory}")
+    if artifacts:
+        _LOGGER.info("Wrote artifacts under %s", out)
+        for artifact in artifacts:
+            _LOGGER.info("  %s", artifact)
 
 
 _ORDER_CHANGE = re.compile(r"^validate-([0-9a-f]{12})(?:-|$)")
@@ -1972,21 +2127,38 @@ def _reasons(rejections: list[RejectionSummary]) -> str:
     return f"rejected: {top}{more}"
 
 
-def main() -> int:
+def main(configure_logging: LoggingConfigurator | None = None) -> int:
+    """Run the dependency-free runner CLI.
+
+    Args:
+        configure_logging: CLI-boundary logging configuration. The Poetry wrapper supplies Rich
+            rendering; omitted, vendored runners use the standard-library formatter.
+
+    Returns:
+        The command's process exit code.
+    """
     parser = argparse.ArgumentParser(prog="mo-eval-runner", description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    s = commands.add_parser("suite", help="mine, validate, and write this repository's suite")
-    s.add_argument("--repo", type=Path, default=Path("."))
-    s.add_argument("--config", type=Path, default=CONFIG_PATH, help="relative to --repo")
-    s.add_argument("--service", default="local", help="'local' or the service base URL")
-    s.add_argument("--token", default=None, help="bearer token, else $MO_EVAL_TOKEN")
-    s.add_argument("--branch", default=None)
-    s.add_argument("--history", type=int, default=300)
-    s.add_argument("--candidates", type=int, default=8)
-    s.add_argument("--validate", type=int, default=0, help="cap on orders to run (0 = all)")
-    s.add_argument("--out", type=Path, default=Path(".mo-eval") / "out")
-    s.add_argument("--dry-run", action="store_true", help="stop after orders are issued; run nothing")
-    s.add_argument(
+    commands = parser.add_subparsers(required=True)
+    suite_parser = commands.add_parser("suite", help="mine, validate, and write this repository's suite")
+    suite_parser.add_argument("--repo", type=Path, default=Path("."))
+    suite_parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="relative to --repo")
+    suite_parser.add_argument("--service", default="local", help="'local' or the service base URL")
+    suite_parser.add_argument("--token", default=None, help="bearer token, else $MO_EVAL_TOKEN")
+    suite_parser.add_argument("--branch", default=None)
+    suite_parser.add_argument("--history", type=int, default=300)
+    suite_parser.add_argument("--candidates", type=int, default=8)
+    suite_parser.add_argument("--validate", type=int, default=0, help="cap on orders to run (0 = all)")
+    suite_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="output directory (default: <repo>/.mo-eval/out)",
+    )
+    suite_parser.add_argument(
+        "--dry-run", action="store_true", help="stop after orders are issued; run nothing"
+    )
+    suite_parser.add_argument("--verbose", action="store_true", help="show detailed progress logging")
+    suite_parser.add_argument(
         "--run",
         nargs="*",
         metavar="ROUTE",
@@ -1995,38 +2167,39 @@ def main() -> int:
             "after validating, upload the bundles and ask the service to evaluate them on these model routes"
         ),
     )
-    s.add_argument(
+    suite_parser.add_argument(
         "--harnesses",
         nargs="+",
         metavar="NAME",
         default=None,
         help="client harnesses to compare, each against every route: mo, cc, pi (default: mo)",
     )
-    s.add_argument("--repeats", type=int, default=1)
-    s.set_defaults(command_fn=suite)
-    m = commands.add_parser(
+    suite_parser.add_argument("--repeats", type=int, default=1)
+    suite_parser.set_defaults(command_fn=suite)
+    submit_parser = commands.add_parser(
         "submit", help="upload an already-validated --out tree and ask the service to evaluate it"
     )
-    m.add_argument("--out", required=True)
-    m.add_argument("--repo-name", required=True, help="owner/name the suite was mined from")
-    m.add_argument("--service", required=True)
-    m.add_argument("--token", default=None, help="bearer token, else $MO_EVAL_TOKEN")
-    m.add_argument(
+    submit_parser.add_argument("--out", required=True)
+    submit_parser.add_argument("--repo-name", required=True, help="owner/name the suite was mined from")
+    submit_parser.add_argument("--service", required=True)
+    submit_parser.add_argument("--token", default=None, help="bearer token, else $MO_EVAL_TOKEN")
+    submit_parser.add_argument("--verbose", action="store_true", help="show detailed progress logging")
+    submit_parser.add_argument(
         "--run",
         nargs="+",
         metavar="ROUTE",
         required=True,
         help="model routes, each paired with every harness",
     )
-    m.add_argument(
+    submit_parser.add_argument(
         "--harnesses",
         nargs="+",
         metavar="NAME",
         default=None,
         help="client harnesses to compare, each against every route: mo, cc, pi (default: mo)",
     )
-    m.add_argument("--repeats", type=int, default=1)
-    m.add_argument(
+    submit_parser.add_argument("--repeats", type=int, default=1)
+    submit_parser.add_argument(
         "--conventions-from",
         metavar="REPO",
         default=None,
@@ -2034,11 +2207,12 @@ def main() -> int:
             "a checkout to collect convention sources from (contributing guide, lint config, review comments)"
         ),
     )
-    m.add_argument(
+    submit_parser.add_argument(
         "--history", type=int, default=120, help="merged pull requests to read review comments from"
     )
-    m.set_defaults(command_fn=submit)
+    submit_parser.set_defaults(command_fn=submit)
     arguments = parser.parse_args()
+    (configure_logging or configure_plain_logging)(arguments.verbose)
     command = cast(Callable[[argparse.Namespace], int], arguments.command_fn)
     return command(arguments)
 
