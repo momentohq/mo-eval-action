@@ -49,7 +49,13 @@ from mo_eval_svc.runner.client import (
     plan_order_requests,
 )
 from mo_eval_svc.runner.collect import bounded_text, change_source, repo_facts, tracked_files
-from mo_eval_svc.runner.config import CONFIG_PATH, ConfigError, RunnerConfig, load_config, probe_environment
+from mo_eval_svc.runner.config import (
+    CONFIG_PATH,
+    ConfigError,
+    RunnerConfig,
+    load_config,
+    probe_environment,
+)
 from mo_eval_svc.runner.execute import (
     OrderError,
     Runner,
@@ -59,8 +65,10 @@ from mo_eval_svc.runner.execute import (
     commit_or_refuse,
 )
 from mo_eval_svc.wire import (
+    CLIENT_VERSION_PATTERN,
     SCORER_IN_TREE,
     ChangeSource,
+    ClientVersions,
     ConventionSources,
     OrderResult,
     OrdersResponse,
@@ -76,6 +84,7 @@ from mo_eval_svc.wire import (
     Wire,
     WorkOrder,
 )
+from mo_eval_svc.worker_platform import DEFAULT_WORKER_PLATFORM, WorkerPlatform
 
 _LOGGER = logging.getLogger(__name__)
 """Runner progress events. Entrypoints choose their rendering without coupling the runner to one."""
@@ -448,6 +457,24 @@ def _stage_what_the_commit_carried(repo: Path, commit: str, root: Path, git: lis
         raise OrderError(f"could not stage the files {commit} carried: {detail}")
 
 
+def resolved_worker_platform(config: RunnerConfig | None) -> WorkerPlatform:
+    """Return a configured worker platform or the compatibility default.
+
+    The optional configuration belongs to generated task metadata that predates platform
+    declarations. Both runner Docker paths use this one resolution so they cannot silently choose
+    different architectures for the same bundle.
+
+    Args:
+        config: Repository configuration when the bundle was created from a configured checkout.
+
+    Returns:
+        The declared platform, or Linux x86-64 for a legacy missing configuration.
+    """
+    if config is None:
+        return DEFAULT_WORKER_PLATFORM
+    return config.worker_platform
+
+
 def _refuse_a_task_its_own_image_cannot_score(
     root: Path, meta: dict[str, JSONAny], config: RunnerConfig | None, run: _ScoreCommand | None = None
 ) -> None:
@@ -515,6 +542,8 @@ def _refuse_a_task_its_own_image_cannot_score(
             [
                 "docker",
                 "run",
+                "--platform",
+                resolved_worker_platform(config).value,
                 "--rm",
                 "--name",
                 container,
@@ -886,7 +915,9 @@ def _prepare_offline(
         # one platform and one interpreter: preparing `sqlglot` on macOS produced
         # `duckdb-1.5.5-cp313-cp313-macosx_11_0_arm64.whl`, which a linux/amd64 worker running
         # Python 3.12 cannot use — and the preparation SUCCEEDS, so the bundle looks complete and
-        # fails offline much later. Prepared where it will be consumed, it is right by construction.
+        # fails offline much later. Prepared where it will be consumed, it is right by construction on
+        # every axis the worker has: operating system and interpreter from the image, and CPU
+        # architecture from `--platform`, which would otherwise follow this host on a multi-arch image.
         #
         # With a network, unlike scoring: this is the step whose whole job is fetching what scoring
         # will not be able to.
@@ -900,6 +931,8 @@ def _prepare_offline(
                 [
                     "docker",
                     "run",
+                    "--platform",
+                    resolved_worker_platform(config).value,
                     "--rm",
                     "--name",
                     container,
@@ -1270,6 +1303,54 @@ def suite_exit(*, written: int, shipped: int, asked_to_run: bool) -> int:
     return 0
 
 
+def client_version(value: str) -> str | None:
+    """Parse a `--mo-version` / `--claude-code-version` / `--codex-version` value.
+
+    Checked as the arguments are parsed, so a malformed one costs nothing: the service would refuse
+    it too, but only at `/v1/runs`, after the suite was mined and its bundles uploaded.
+
+    Args:
+        value: The raw flag value. Empty is how the Action passes an input left unset.
+
+    Returns:
+        The version, or `None` for empty, which stages the lane's pin.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not a release version.
+    """
+    if not value:
+        return None
+    if not CLIENT_VERSION_PATTERN.match(value):
+        raise argparse.ArgumentTypeError(f"expected a release version like 1.2.3, got {value!r}")
+    return value
+
+
+def requested_client_versions(arguments: argparse.Namespace) -> ClientVersions | None:
+    """The releases a run asks the lane to stage in place of its pins.
+
+    Args:
+        arguments: Parsed `suite` or `submit` arguments.
+
+    Returns:
+        The named versions, or `None` when none is named, so the request carries no key.
+
+    Raises:
+        ValueError: If a Claude Code or Codex release is named but no `cc` or `codex` harness would
+            run it — refused here, before the suite is mined, rather than by the service afterwards.
+    """
+    versions = ClientVersions(
+        mo=arguments.mo_version, claude_code=arguments.claude_code_version, codex=arguments.codex_version
+    )
+    if versions == ClientVersions():
+        return None
+    harnesses = arguments.harnesses or []
+    if versions.claude_code is not None and "cc" not in harnesses:
+        raise ValueError(f"Claude Code {versions.claude_code} is named, but no cc harness runs it")
+    if versions.codex is not None and "codex" not in harnesses:
+        raise ValueError(f"Codex {versions.codex} is named, but no codex harness runs it")
+    return versions
+
+
 def suite(arguments: argparse.Namespace) -> int:
     repo = arguments.repo.resolve()
     out = (arguments.out if arguments.out is not None else repo / ".mo-eval" / "out").resolve()
@@ -1277,6 +1358,11 @@ def suite(arguments: argparse.Namespace) -> int:
     # Before anything can fail: `--out` may be reused, and a funnel record left by the previous
     # run would tell the Action's summary step that this run reported one.
     (out / FUNNEL_RECORD).unlink(missing_ok=True)
+    try:
+        client_versions = requested_client_versions(arguments)
+    except ValueError as failure:
+        _LOGGER.error("Configuration failed: %s", failure)
+        return 2
     try:
         config = load_config(repo / arguments.config)
     except ConfigError as failure:
@@ -1323,7 +1409,14 @@ def suite(arguments: argparse.Namespace) -> int:
     _LOGGER.debug("Collected %d merged change(s) via %s", len(facts.changes), facts.source)
     # Recorded after the declaration is folded in, so the audit holds what was sent rather than an
     # earlier version of it.
-    facts = wire.crossing("up", "repo-facts", replace(facts, worker_image=config.worker_image))
+    facts = wire.crossing(
+        "up",
+        "repo-facts",
+        replace(
+            facts,
+            worker_image=config.worker_image,
+        ),
+    )
     try:
         _LOGGER.info("Selecting up to %d candidate change(s)", arguments.candidates)
         request = wire.crossing("down", "source-request", client.select(facts, arguments.candidates))
@@ -1413,6 +1506,7 @@ def suite(arguments: argparse.Namespace) -> int:
                 conventions=conventions,
                 harnesses=arguments.harnesses,
                 refusals=refusals,
+                client_versions=client_versions,
             )
         except ServiceError as failure:
             # The validated tasks are already on disk, so this is recoverable: the same hand-off is
@@ -1444,6 +1538,11 @@ def submit(arguments: argparse.Namespace) -> int:
     """
     out = Path(arguments.out)
     repo_name = arguments.repo_name
+    try:
+        client_versions = requested_client_versions(arguments)
+    except ValueError as failure:
+        _LOGGER.error("Hosted handoff refused: %s", failure)
+        return 2
     _LOGGER.info("Preparing hosted handoff from %s", arguments.out)
     conventions = None
     if arguments.conventions_from is not None:
@@ -1458,6 +1557,7 @@ def submit(arguments: argparse.Namespace) -> int:
             repeats=arguments.repeats,
             conventions=conventions,
             harnesses=arguments.harnesses,
+            client_versions=client_versions,
         )
     except ServiceError as failure:
         # Reported the way `suite` reports it: a named service that cannot be reached is a message
@@ -1605,8 +1705,11 @@ def _hand_off(
     conventions: ConventionSources | None = None,
     harnesses: list[str] | None = None,
     refusals: list[str] | None = None,
+    client_versions: ClientVersions | None = None,
 ) -> int:
     """Upload every validated bundle to the service's storage and record a run for the lane.
+
+    `client_versions` names releases the lane stages in place of its pins; `None` sends no key.
 
     Returns:
         How many bundles were handed off. Zero is a real outcome — a suite whose bundles were all
@@ -1764,6 +1867,7 @@ def _hand_off(
             categories=categories,
             sizes=sizes,
             harnesses=harnesses,
+            client_versions=client_versions,
         )
     )
     _LOGGER.info(
@@ -2127,6 +2231,35 @@ def _reasons(rejections: list[RejectionSummary]) -> str:
     return f"rejected: {top}{more}"
 
 
+def _add_client_version_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the flags naming releases the lane stages in place of its pins.
+
+    Args:
+        parser: The `suite` or `submit` subcommand parser.
+    """
+    parser.add_argument(
+        "--mo-version",
+        type=client_version,
+        default=None,
+        metavar="X.Y.Z",
+        help="published mo release every arm stages (default: the lane's pin)",
+    )
+    parser.add_argument(
+        "--claude-code-version",
+        type=client_version,
+        default=None,
+        metavar="X.Y.Z",
+        help="published Claude Code release a cc arm runs (default: the lane's pin)",
+    )
+    parser.add_argument(
+        "--codex-version",
+        type=client_version,
+        default=None,
+        metavar="X.Y.Z",
+        help="published Codex release a codex arm runs (default: the lane's pin)",
+    )
+
+
 def main(configure_logging: LoggingConfigurator | None = None) -> int:
     """Run the dependency-free runner CLI.
 
@@ -2172,9 +2305,10 @@ def main(configure_logging: LoggingConfigurator | None = None) -> int:
         nargs="+",
         metavar="NAME",
         default=None,
-        help="client harnesses to compare, each against every route: mo, cc, pi (default: mo)",
+        help="harnesses to compare against every route: mo, cc, pi, strands, codex (default: mo)",
     )
     suite_parser.add_argument("--repeats", type=int, default=1)
+    _add_client_version_arguments(suite_parser)
     suite_parser.set_defaults(command_fn=suite)
     submit_parser = commands.add_parser(
         "submit", help="upload an already-validated --out tree and ask the service to evaluate it"
@@ -2196,9 +2330,10 @@ def main(configure_logging: LoggingConfigurator | None = None) -> int:
         nargs="+",
         metavar="NAME",
         default=None,
-        help="client harnesses to compare, each against every route: mo, cc, pi (default: mo)",
+        help="harnesses to compare against every route: mo, cc, pi, strands, codex (default: mo)",
     )
     submit_parser.add_argument("--repeats", type=int, default=1)
+    _add_client_version_arguments(submit_parser)
     submit_parser.add_argument(
         "--conventions-from",
         metavar="REPO",

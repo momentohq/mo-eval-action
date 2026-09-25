@@ -9,8 +9,12 @@ against. What the repository keeps is small: this Action in a workflow, and one 
 language = "go"
 test_command = "go test"
 worker_image = "golang:1.25-bookworm@sha256:…"   # pinned by digest; a mutable tag is refused
+worker_platform = "linux/amd64"                   # optional; `linux/amd64` is the compatibility default
 # repo = "owner/name"   # only on a fork: whose merged pull requests are the record
 ```
+
+`worker_platform` is `linux/amd64` for hosted lanes. The service writes that resolved value to the
+generated manifest's `environment.platform`, which pins worker Docker calls and staged clients.
 
 ```yaml
 # .github/workflows/mo-eval.yml
@@ -22,7 +26,7 @@ on:
         description: Models to evaluate, space-separated ("none" = build the suite only)
         default: "anthropic/claude-opus-5 momento/zai-org/GLM-5.3"
       harnesses:
-        description: Coding-agent harnesses, space-separated (mo, cc, pi)
+        description: Coding-agent harnesses, space-separated (mo, cc, pi, strands, codex)
         default: "mo"
 permissions:
   contents: read
@@ -108,13 +112,16 @@ outside it:
 | `service` | the hosted service | Base URL of the mo-eval service; override for another deployment |
 | `token` | — | Optional. Without it the job authenticates as the repository via GitHub's OIDC token (`permissions: id-token: write`); with it, a static bearer for the service |
 | `arms` | `none` | Model routes to evaluate on; `none` builds the suite without running it |
-| `harnesses` | `mo` | Space-separated `mo`, `cc`, `pi`; each runs against every model route. Set `mo pi` to compare Mo and Pi |
+| `harnesses` | `mo` | Space-separated `mo`, `cc`, `pi`, `strands`, `codex`; each runs against every model route. Set `mo pi` to compare Mo and Pi |
 | `history` | `300` | Merged pull requests offered as candidates |
 | `candidates` | `12` | Candidates the service is asked to source |
 | `config` | `.mo-eval/config.toml` | The repository's configuration |
 | `out` | runner temp | Where the suite is written; nothing lands in the checkout |
 | `dry-run` | `false` | `"true"` mines and selects, prints the funnel, and runs nothing: a first look at fit in seconds |
 | `repeats` | `1` | How many times to run each arm, so a comparison rests on more than one sample. **1 to 5.** The service **refuses** an over-cap request rather than running fewer — a run recorded as 5 when 9 was asked for would be a different benchmark reported as yours |
+| `mo-version` | the pin | Published `mo` release (`X.Y.Z`) every arm runs, in place of the pinned one. Staged only after it matches the release's `SHA256SUMS`; the run's `suite.json` names it under `client_versions` |
+| `claude-code-version` | the pin | Published Claude Code release (`X.Y.Z`) a `cc` arm runs, for a model Anthropic serves only to a newer Claude Code. Needs `cc` in `harnesses`. Staged only after it matches the release manifest's checksum; named in `suite.json` like `mo-version` |
+| `codex-version` | the pin | Published Codex CLI release (`X.Y.Z`, the `rust-v` tag without its prefix) a `codex` arm runs. Needs `codex` in `harnesses`. A version the lane pins a digest for is held to it; any other to the SHA-256 GitHub publishes for the release asset, and refused when GitHub lists none. Named in `suite.json` like `mo-version` |
 | `repo-name` | this repository | The `owner/name` the suite was mined as — the tenant the service proved its tasks under. Set it only when the config declares an upstream with `repo = "owner/name"`: on a fork that is the upstream, and the checkout's own name would be a different tenant |
 | `reuse-suite` | — | Path to a suite a previous run already mined and validated. Set it to skip mining and validation and only run `arms`. The path must outlive the run that built it — use a **cache**, not this Action's artifact, which carries the task records and not the runnable bundles. Cannot be combined with `dry-run` (there is no mining pass to stop short of) and needs `arms` set |
 

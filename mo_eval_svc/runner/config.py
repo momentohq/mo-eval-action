@@ -25,8 +25,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from mo_eval_svc.languages import LANGUAGES
+from mo_eval_svc.wire import MO_EVAL_DIRECTORY, in_mo_eval_directory
+from mo_eval_svc.worker_platform import (
+    DEFAULT_WORKER_PLATFORM,
+    WorkerPlatform,
+    WorkerPlatformError,
+)
 
-CONFIG_PATH = Path(".mo-eval") / "config.toml"
+CONFIG_PATH = Path(MO_EVAL_DIRECTORY) / "config.toml"
 
 _MAX_OFFLINE_ARTIFACTS = 16
 """How many paths a vendoring may name. One or two is the real shape; the bound is on the subprocess
@@ -40,6 +46,7 @@ _KNOWN_KEYS = {
     "env",
     "repo",
     "worker_image",
+    "worker_platform",
     "offline_prepare",
     "offline_artifacts",
 }
@@ -68,6 +75,8 @@ class RunnerConfig:
     worker_image: str | None = None
     """An OCI image pinned by digest that can build and test this repository — what a containerized
     agent run executes in. Optional: without it, tasks are emitted for host-native t-suite only."""
+    worker_platform: WorkerPlatform = DEFAULT_WORKER_PLATFORM
+    """Resolved OCI platform for the worker image."""
     offline_prepare: str | None = None
     """A command that puts this repository's dependencies INTO the tree, run before a task is frozen.
 
@@ -130,6 +139,18 @@ def load_config(path: Path) -> RunnerConfig:
         raise ConfigError(
             f"{path}: `worker_image` must be pinned by digest (name@sha256:<64 hex>), got {image!r}"
         )
+    raw_worker_platform = raw.get("worker_platform")
+    try:
+        worker_platform = WorkerPlatform.effective(WorkerPlatform.parse(raw_worker_platform))
+    except WorkerPlatformError as error:
+        raise ConfigError(f"{path}: `worker_platform` {error}") from error
+    if image is None and "worker_platform" in raw:
+        raise ConfigError(f"{path}: `worker_platform` requires `worker_image`")
+    if worker_platform is not DEFAULT_WORKER_PLATFORM:
+        raise ConfigError(
+            f"{path}: `worker_platform` must be `{DEFAULT_WORKER_PLATFORM.value}` because hosted lanes "
+            "run x86-64"
+        )
     setup = raw.get("setup_command")
     if setup is not None and (not isinstance(setup, str) or not setup.strip()):
         raise ConfigError(f"{path}: `setup_command`, when set, must be a non-empty string")
@@ -146,6 +167,14 @@ def load_config(path: Path) -> RunnerConfig:
         raise ConfigError(
             f"{path}: at most {_MAX_OFFLINE_ARTIFACTS} `offline_artifacts` may be named, got {len(artifacts)}"
         )
+    hidden = [artifact for artifact in artifacts if in_mo_eval_directory(artifact.strip())]
+    if hidden:
+        # A generated suite makes the whole directory scorer-only, so the score check (which sees the
+        # full tree) would pass while the agent's setup, run without it, found nothing vendored.
+        raise ConfigError(
+            f"{path}: `offline_artifacts` may not live under `{MO_EVAL_DIRECTORY}/`, which the agent "
+            f"never sees: {', '.join(hidden)}"
+        )
     if prepare and not artifacts:
         # A preparation whose output is not named is a preparation that runs and reaches nobody: the
         # snapshotter freezes tracked files, and what this produces is exactly what a `.gitignore`
@@ -160,6 +189,7 @@ def load_config(path: Path) -> RunnerConfig:
         env={str(key): value for key, value in env.items()},
         repo=raw.get("repo"),
         worker_image=image,
+        worker_platform=worker_platform,
         offline_prepare=prepare.strip() if isinstance(prepare, str) else None,
         offline_artifacts=tuple(a.strip() for a in artifacts),
     )

@@ -26,7 +26,7 @@ inputs:
     default: "none"
   harnesses:
     description: >-
-      Coding-agent harnesses to evaluate against every model route, space-separated: mo, cc, pi, strands.
+      Coding-agent harnesses to evaluate against every model route, space-separated: mo, cc, pi, strands, codex.
     default: "mo"
   history:
     description: How many recently merged pull requests to offer as candidates
@@ -53,6 +53,25 @@ inputs:
       caps this and REFUSES an over-cap request rather than quietly running fewer — a run recorded
       as the cap when more was asked for would be a different benchmark reported as yours.
     default: "1"
+  mo-version:
+    description: >-
+      Published mo release to run every arm on, as `X.Y.Z`, in place of the version the service
+      pins. Leave empty for the pin. The lane stages it only after checking it against the release's
+      published SHA256SUMS, and the run's results name the version it ran.
+    default: ""
+  claude-code-version:
+    description: >-
+      Published Claude Code release a `cc` arm runs, as `X.Y.Z`, in place of the pinned one — for a
+      model Anthropic serves only to a newer Claude Code. Leave empty for the pin. Needs `cc` among
+      `harnesses`. Verified against the release manifest's checksum, and named in the run's results.
+    default: ""
+  codex-version:
+    description: >-
+      Published Codex CLI release a `codex` arm runs, as `X.Y.Z` (the `rust-v` tag without its
+      prefix), in place of the pinned one. Leave empty for the pin. Needs `codex` among `harnesses`.
+      A version the lane does not pin a digest for is verified against the SHA-256 GitHub publishes
+      for the release asset, and refused when GitHub lists none. Named in the run's results.
+    default: ""
   repo-name:
     description: >-
       The `owner/name` the suite was mined as, which is the tenant the service proved its tasks
@@ -95,6 +114,9 @@ runs:
           --out "${{ inputs.out || format('{0}/mo-eval', runner.temp) }}" \
           --harnesses "${harnesses[@]}" \
           --repeats "$MO_EVAL_REPEATS" \
+          --mo-version "$MO_EVAL_MO_VERSION" \
+          --claude-code-version "$MO_EVAL_CLAUDE_CODE_VERSION" \
+          --codex-version "$MO_EVAL_CODEX_VERSION" \
           ${{ inputs.dry-run == 'true' && '--dry-run' || '' }} \
           ${{ inputs.arms != 'none' && format('--run {0}', inputs.arms) || '' }}
       env:
@@ -103,6 +125,9 @@ runs:
         # into the source BEFORE the shell parses it, so `$(…)` in an input runs even inside double
         # quotes. An environment value is data the shell expands, not source it re-reads.
         MO_EVAL_REPEATS: ${{ inputs.repeats }}
+        MO_EVAL_MO_VERSION: ${{ inputs.mo-version }}
+        MO_EVAL_CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+        MO_EVAL_CODEX_VERSION: ${{ inputs.codex-version }}
         MO_EVAL_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ github.token }}   # reads this repository's merged pull requests
 
@@ -165,6 +190,9 @@ runs:
           --history "$MO_EVAL_HISTORY" \
           --harnesses "${harnesses[@]}" \
           --repeats "$MO_EVAL_REPEATS" \
+          --mo-version "$MO_EVAL_MO_VERSION" \
+          --claude-code-version "$MO_EVAL_CLAUDE_CODE_VERSION" \
+          --codex-version "$MO_EVAL_CODEX_VERSION" \
           --run "${arms[@]}"
       env:
         # Every input arrives as an environment value, not as `${{ … }}` spliced into the script —
@@ -178,6 +206,9 @@ runs:
         MO_EVAL_SERVICE: ${{ inputs.service }}
         MO_EVAL_HISTORY: ${{ inputs.history }}
         MO_EVAL_REPO_NAME: ${{ inputs.repo-name }}
+        MO_EVAL_MO_VERSION: ${{ inputs.mo-version }}
+        MO_EVAL_CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+        MO_EVAL_CODEX_VERSION: ${{ inputs.codex-version }}
         MO_EVAL_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ github.token }}   # reads review comments for the conventions judge
 

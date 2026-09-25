@@ -478,6 +478,8 @@ LANGUAGES: dict[str, Language] = {
         # which resets PATH to the Debian default and drops /usr/local/go/bin — so `go` is "not
         # found" in the very image that ships it, and a baseline "fails" for a reason that is not
         # the task. Re-adding the standard Go locations is harmless where they are already present.
+        # mo-eval's workers restore the image's PATH themselves (#4637); the preamble keeps the scorer
+        # right in a login shell without that profile, such as a worker from an older mo-eval.
         scorer_preamble='command -v go >/dev/null 2>&1 || export PATH="$PATH:/usr/local/go/bin:/go/bin"',
         # Measured on gin in `golang:1.26-bookworm` as uid 1000: `go test ./...` takes 33s cold and 3s
         # against a cache this seed filled, with no test result served from it.
@@ -723,7 +725,28 @@ LANGUAGES: dict[str, Language] = {
         # all and every answer looks the same: unset it colours, `GTEST_COLOR=no` suppresses,
         # `--gtest_color=no` suppresses, and `--gtest_color=yes` BEATS `GTEST_COLOR=no` — which is
         # why the flag is declared too rather than this replacing it.
-        scorer_preamble="export GTEST_COLOR=no",
+        #
+        # The PATH export puts ccache's compiler symlinks ahead of `/usr/bin`, so `cc`/`gcc`/`g++`
+        # route through ccache and hit the seeded `CCACHE_DIR` (#4570). Set here, not as a Docker
+        # `ENV`, because a worker runs under `sh -lc` whose `/etc/profile` resets PATH — the same
+        # reason `go`'s contract repairs its own PATH. This preamble runs on every graded worker
+        # (baseline, scorer) and is prepended to the cache seed, so all of them share the cache.
+        #
+        # Which also makes it the one place to measure the cache without teaching mo-eval's generic
+        # seed path about ccache: each worker zeroes its counters (a grading worker's clone carries
+        # the seed's) and prints its own hits and misses to stderr on exit, into its log. An EXIT
+        # trap keeps the worker's exit status, and stderr keeps the stats out of the reports the
+        # patterns above read. Skipped where the image has no ccache, and never fatal: the scorer
+        # runs this under `set -euo pipefail`, so a failing ccache must not abort the grade.
+        scorer_preamble=(
+            'export GTEST_COLOR=no; export PATH="/usr/lib/ccache:$PATH"; '
+            "if command -v ccache >/dev/null 2>&1; then ccache -z >/dev/null 2>&1 || true; "
+            "trap 'ccache -s >&2 || true' EXIT; fi"
+        ),
+        # A C project has no ecosystem-wide compile command, so the seed reuses the repository's own
+        # test command over the start state (see `finalize._build_cache_lines`); ccache fills from
+        # whatever that build compiles, and every grading worker gets a private clone of it.
+        build_cache_variable="CCACHE_DIR",
         # No `build_failed_at`/`build_failed_summary`, and not for want of measuring. gcc's wording
         # is `test_sds.cpp:709:18: error: 'x' was not declared in this scope` and make's is
         # `make: *** [Makefile:226: test_sds.o] Error 1`, but neither path resolves. gcc spells it

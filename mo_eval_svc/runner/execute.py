@@ -24,7 +24,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, cast
 
-from mo_eval_svc.wire import OrderResult, Step, StepResult, WorkOrder
+from mo_eval_svc.wire import MO_EVAL_DIRECTORY, OrderResult, Step, StepResult, WorkOrder
 
 _RUNNER_CREDENTIALS = (
     "MO_EVAL_TOKEN",  # the bearer this runner authenticates to the service with
@@ -834,19 +834,26 @@ class Runner:
         return tail
 
 
-def _export_into(repo: Path, commit: str, workspace: Path, timeout: float) -> None:
-    """Stream a commit's tree out of `repo` and unpack it into `workspace`.
+_WITHOUT_MO_EVAL_DIRECTORY = f":(top,exclude){MO_EVAL_DIRECTORY}"
+"""Pathspec leaving the repository's own mo-eval directory out of every export: its configuration is
+not source the task is about, and exported it would sit in the agent's workspace beside the suite a
+bundle writes there."""
 
-    The producer is held in its own session so a deadline takes it and not only the extraction it
-    feeds, and both its pipe and the process itself are released whether the extraction succeeded,
-    failed or ran out of time.
+
+def _export_into(repo: Path, commit: str, workspace: Path, timeout: float) -> None:
+    """Stream a commit's tree, without the repository's `.mo-eval/`, out of `repo` into `workspace`.
+
+    Validation orders and bundles both export through here, so the tree a task was validated on is
+    the tree it ships with. The producer is held in its own session so a deadline takes it and not
+    only the extraction it feeds, and both its pipe and the process itself are released whether the
+    extraction succeeded, failed or ran out of time.
 
     Raises:
         OrderError: If either side fails, or the producer does not finish.
         subprocess.TimeoutExpired: If the extraction does not finish.
     """
     archive = subprocess.Popen(
-        ["git", "archive", "--format=tar", "--", commit],
+        ["git", "archive", "--format=tar", "--", commit, _WITHOUT_MO_EVAL_DIRECTORY],
         cwd=repo,
         stdout=subprocess.PIPE,
         start_new_session=True,

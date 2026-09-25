@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import NoneType, UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
@@ -397,7 +398,7 @@ class ArmPayload:
     effort sweep, which a cross product cannot express because the pair appears once in it."""
 
     harness: str
-    """Client harness this arm runs: `mo`, `cc`, `pi`, `strands`. The service refuses a name it
+    """Client harness this arm runs: `mo`, `cc`, `pi`, `strands`, `codex`. The service refuses a name it
     cannot run; the accepted set lives in `service/app.py` and `lane/dispatch.py`."""
     model_route: str
     """Gateway route the harness calls (`anthropic/claude-opus-5`)."""
@@ -410,6 +411,30 @@ class ArmPayload:
     different grade names it. Nothing here can currently ask for the route's own no-hint default.
 
     Which grades are accepted is the harness's own business — each parses the flag itself."""
+
+
+CLIENT_VERSION_PATTERN = re.compile(r"\A(?:0|[1-9][0-9]{0,5})(?:\.(?:0|[1-9][0-9]{0,5})){2}\Z")
+"""A release version a run may name: `MAJOR.MINOR.PATCH`, three plain numbers, as `mo` and Claude Code
+name theirs. The value becomes a release URL segment when the lane stages it, so no prefix, suffix,
+separator, path segment or whitespace passes. Checked by the runner before it spends anything and by
+the service before it records the run; the lane states it again (`lane/dispatch.py`)."""
+
+
+@dataclass(frozen=True)
+class ClientVersions:
+    """Published releases a run stages in place of the lane image's pins, one field per binary.
+
+    A named release is held to its publisher's digest, as a pin is: the tap's `SHA256SUMS` for `mo`,
+    the release manifest's checksum for Claude Code, and for Codex the digest mo-eval pins for that
+    version or, for a version it pins none for, the SHA-256 GitHub publishes for the release asset.
+    Naming one changes which build is measured, never whether it is verified. `None` is the pin."""
+
+    mo: str | None = None
+    """`mo` release every arm stages, or `None` for the pin."""
+    claude_code: str | None = None
+    """Claude Code release a `cc` arm execs, or `None` for the pin. Refused when no arm runs `cc`."""
+    codex: str | None = None
+    """Codex release a `codex` arm execs, or `None` for the pin. Refused when no arm runs `codex`."""
 
 
 @dataclass(frozen=True)
@@ -433,7 +458,8 @@ class RunRequest:
     refuses the second rather than silently falling back to the first."""
     repeats: int = 1
     harnesses: list[str] | None = None
-    """Client harnesses to compare — `mo`, `cc`, `pi` — and the service refuses a name it cannot run.
+    """Client harnesses to compare — `mo`, `cc`, `pi`, `strands`, `codex` — and the service refuses a
+    name it cannot run.
 
     The accepted set lives in `service/app.py` and again in `lane/dispatch.py`, held equal by a test,
     because both must agree before a job is claimed. Read `_HARNESSES` there rather than trusting
@@ -451,6 +477,11 @@ class RunRequest:
     """Task id -> bug-fix | feature | refactor | performance | test-infra."""
     sizes: dict[str, str] = field(default_factory=dict)
     """Task id -> S | M | L."""
+    client_versions: ClientVersions | None = None
+    """Releases to stage in place of the pins, or `None` to run every pin.
+
+    `None` rather than an empty `ClientVersions`, so a run naming none sends no key: `to_json` omits
+    a `None` field, and a service predating the field refuses a key it does not know."""
 
 
 @dataclass(frozen=True)
@@ -601,7 +632,29 @@ memory.
 """
 
 
-SCORER_IN_TREE = ".mo-eval/acceptance/acceptance.sh"
+MO_EVAL_DIRECTORY = ".mo-eval"
+"""The repository-root directory mo-eval owns, on both sides of the contract.
+
+A repository keeps its own configuration there, which the runner leaves out of every tree it
+exports and selection refuses to mine; a generated bundle writes its suite there, which the manifest
+makes scorer-only so the agent never sees it. Spelled once so the export, selection, configuration
+and manifest cannot disagree about which directory that is.
+"""
+
+
+def in_mo_eval_directory(path: str) -> bool:
+    """Whether a repository-relative path is `MO_EVAL_DIRECTORY` or lies beneath it.
+
+    Compared by path component, so a sibling that only shares the prefix (`.mo-eval-wheels`) is
+    outside it, and a leading `./` is not.
+
+    Returns:
+        True when the path's first component is the mo-eval directory.
+    """
+    return PurePosixPath(path).parts[:1] == (MO_EVAL_DIRECTORY,)
+
+
+SCORER_IN_TREE = f"{MO_EVAL_DIRECTORY}/acceptance/acceptance.sh"
 """Where a packaged task's generated scorer sits inside its own start tree.
 
 A service/runner contract value rather than either side's detail: the service writes the scorer
@@ -655,7 +708,7 @@ def event_cost(text: str) -> int:
     return len(json.dumps(text)) - 2
 
 
-PROTOCOL = 6
+PROTOCOL = 7
 """The revision of this protocol the copy of these types in THIS tree speaks.
 
 Sent by the runner as `RepoFacts.protocol` so the service knows which fields it may put in an order.
@@ -687,6 +740,11 @@ is the number that shipped with it.
    one names the cross product and still always sends `arms`, so nothing it sends stops decoding
    and there is nothing to withhold from it. `RunSummary` it never asks for, as in 3. The number
    moves because the Action vendors this whole file and its surface did.
+7. `ClientVersions` and `RunRequest.client_versions`: a run may name the `mo`, Claude Code and Codex
+   releases it stages in place of the lane's pins. Declared, as 5 was: only a runner SENDS it, one naming no
+   version omits the key, so an older service still decodes every request an older-behaving runner
+   sends. A runner naming a version against a service that predates the field is refused at
+   `/v1/runs` for the unknown key, rather than run at the pins.
 """
 
 MAX_DECODED_ENTRIES = 1_000_000
